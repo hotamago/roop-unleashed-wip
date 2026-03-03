@@ -6,6 +6,7 @@ import roop.globals
 import roop.metadata
 import roop.utilities as util
 import ui.globals as uii
+import ui.globals
 
 from ui.tabs.faceswap_tab import faceswap_tab
 from ui.tabs.livecam_tab import livecam_tab
@@ -70,11 +71,17 @@ def run():
             with gr.Row(variant='compact'):
                     gr.Markdown(f"### [{roop.metadata.name} {roop.metadata.version}](https://github.com/C0untFloyd/roop-unleashed)")
                     gr.HTML(util.create_version_html(), elem_id="versions")
-            faceswap_tab()
+                    bt_save_session = gr.Button("💾 Save Settings", size='sm', variant='primary', scale=0)
+                    bt_load_session = gr.Button("📂 Load Settings", size='sm', scale=0)
+            bt_destfiles = faceswap_tab()
             livecam_tab()
             facemgr_tab()
-            extras_tab()
+            extras_tab(bt_destfiles)
             settings_tab()
+            # Wire Save/Load after all tabs so ui.globals component refs are populated
+            _comps = _session_components()
+            bt_save_session.click(fn=save_session, inputs=_comps, outputs=[])
+            bt_load_session.click(fn=load_session, inputs=[], outputs=_comps)
         launch_browser = roop.globals.CFG.launch_browser
 
         uii.ui_restart_server = False
@@ -96,4 +103,57 @@ def run():
 
 def show_msg(msg: str):
     gr.Info(msg)
+
+
+_SESSION_CFG_KEYS = [
+    'face_detection_mode', 'num_swap_steps', 'selected_enhancer', 'max_face_distance',
+    'subsample_upscale', 'blend_ratio', 'video_swapping_method', 'no_face_action',
+    'vr_mode', 'autorotate_faces', 'skip_audio', 'keep_frames', 'wait_after_extraction',
+    'output_method', 'mask_engine', 'mask_clip_text', 'show_mask_offsets',
+    'restore_original_mouth', 'mask_top', 'mask_bottom', 'mask_left', 'mask_right',
+    'mask_erosion', 'mask_blur',
+]
+
+
+def _session_components():
+    return [
+        ui.globals.ui_selected_face_detection,
+        ui.globals.ui_num_swap_steps,
+        ui.globals.ui_selected_enhancer,
+        ui.globals.ui_max_face_distance,
+        ui.globals.ui_upscale,
+        ui.globals.ui_blend_ratio,
+        ui.globals.ui_video_swapping_method,
+        ui.globals.ui_no_face_action,
+        ui.globals.ui_vr_mode,
+        ui.globals.ui_autorotate,
+        ui.globals.ui_skip_audio,
+        ui.globals.ui_keep_frames,
+        ui.globals.ui_wait_after_extraction,
+        ui.globals.ui_output_method,
+        ui.globals.ui_selected_mask_engine,
+        ui.globals.ui_clip_text,
+        ui.globals.ui_chk_showmaskoffsets,
+        ui.globals.ui_chk_restoreoriginalmouth,
+        ui.globals.ui_mask_top,
+        ui.globals.ui_mask_bottom,
+        ui.globals.ui_mask_left,
+        ui.globals.ui_mask_right,
+        ui.globals.ui_mask_erosion,
+        ui.globals.ui_mask_blur,
+    ]
+
+
+def save_session(*values):
+    cfg = roop.globals.CFG
+    for key, val in zip(_SESSION_CFG_KEYS, values):
+        setattr(cfg, key, val)
+    cfg.save()
+    gr.Info('Settings saved!')
+
+
+def load_session():
+    roop.globals.CFG.load()
+    cfg = roop.globals.CFG
+    return tuple(getattr(cfg, key) for key in _SESSION_CFG_KEYS)
 

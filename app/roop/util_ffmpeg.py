@@ -98,6 +98,17 @@ def create_video_from_gif(gif_path: str, output_path):
 
 
 
+def resize_video(input_path: str, output_path: str, width: int, height: int) -> bool:
+    scale_filter = (
+        f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+        f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2'
+    )
+    return run_ffmpeg(['-i', input_path, '-vf', scale_filter,
+                       '-c:v', roop.globals.video_encoder,
+                       '-crf', str(roop.globals.video_quality),
+                       '-c:a', 'copy', output_path])
+
+
 def restore_audio(intermediate_video: str, original_video: str, trim_frame_start, trim_frame_end, final_video : str) -> None:
 	fps = util.detect_fps(original_video)
 	commands = [ '-i', intermediate_video ]
