@@ -4,6 +4,7 @@ module.exports = {
   },
   run: [
     {
+      when: "{{!exists('app')}}",
       method: "shell.run",
       params: {
         message: [
@@ -26,8 +27,8 @@ module.exports = {
       params: {
         uri: "torch.js",
         params: {
-        venv: "env",
-        path: "app",
+          venv: "env",
+          path: "app",
         }
       }
     }

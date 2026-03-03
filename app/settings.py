@@ -59,7 +59,7 @@ class Settings:
             'memory_limit' : self.memory_limit,
             'provider' : self.provider,
             'force_cpu' : self.force_cpu,
-			'output_template' : self.output_template,
+            'output_template' : self.output_template,
             'use_os_temp_folder' : self.use_os_temp_folder,
             'output_show_video' : self.output_show_video,
             'max_face_distance': self.max_face_distance,
