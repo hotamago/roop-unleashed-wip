@@ -265,6 +265,8 @@ def faceswap_tab():
     set_frame_start.click(fn=on_set_frame, inputs=[set_frame_start, preview_frame_num], outputs=[text_frame_clip])
     set_frame_end.click(fn=on_set_frame, inputs=[set_frame_end, preview_frame_num], outputs=[text_frame_clip])
 
+    return bt_destfiles
+
 
 def on_mask_top_changed(mask_offset):
     set_mask_offset(0, mask_offset)

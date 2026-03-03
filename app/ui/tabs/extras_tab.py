@@ -24,7 +24,7 @@ frame_upscalers_map = {
 
 RESOLUTION_CHOICES = ["1280x720", "1920x1080", "854x480", "3840x2160"]
 
-def extras_tab():
+def extras_tab(bt_destfiles=None):
     filternames = ["None"]
     for f in frame_filters_map.keys():
         filternames.append(f)
@@ -91,6 +91,7 @@ def extras_tab():
 
         with gr.Row():
             gr.Button("👀 Open Output Folder", size='sm').click(fn=lambda: util.open_folder(roop.globals.output_path))
+            send_to_faceswap_btn = gr.Button("↗ Send to Face Swap", size='sm', visible=bt_destfiles is not None)
         with gr.Row():
             extra_files_output = gr.Files(label='Resulting output files', file_count="multiple")
 
@@ -101,6 +102,8 @@ def extras_tab():
     extras_create_video.click(fn=on_extras_create_video, inputs=[files_to_process, extras_images_folder, extras_fps, extras_chk_creategif], outputs=[extra_files_output])
     extras_create_video_from_gif.click(fn=on_extras_create_video_from_gif, inputs=[files_to_process, extras_video_fps], outputs=[extra_files_output])
     start_frame_process.click(fn=on_frame_process, inputs=[files_to_process, filterselection, upscalerselection], outputs=[extra_files_output])
+    if bt_destfiles is not None:
+        send_to_faceswap_btn.click(fn=on_send_to_faceswap, inputs=[extra_files_output], outputs=[bt_destfiles])
 
 
 def on_resize_video(files, resolution):
@@ -205,6 +208,12 @@ def on_extras_extract_frames(files):
             if os.path.isfile(outfile):
                 resultfiles.append(outfile)
     return resultfiles
+
+
+def on_send_to_faceswap(files):
+    if files is None:
+        return None
+    return [f.name for f in files]
 
 
 def on_frame_process(files, filterselection, upscaleselection):

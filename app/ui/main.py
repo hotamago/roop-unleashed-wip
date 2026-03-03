@@ -70,10 +70,10 @@ def run():
             with gr.Row(variant='compact'):
                     gr.Markdown(f"### [{roop.metadata.name} {roop.metadata.version}](https://github.com/C0untFloyd/roop-unleashed)")
                     gr.HTML(util.create_version_html(), elem_id="versions")
-            faceswap_tab()
+            bt_destfiles = faceswap_tab()
             livecam_tab()
             facemgr_tab()
-            extras_tab()
+            extras_tab(bt_destfiles)
             settings_tab()
         launch_browser = roop.globals.CFG.launch_browser
 
