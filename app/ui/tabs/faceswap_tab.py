@@ -751,10 +751,10 @@ def on_fps_changed(fps):
 def on_destfiles_changed(destfiles):
     global selected_preview_index, list_files_process, current_video_fps
 
+    list_files_process.clear()
     if destfiles is None or len(destfiles) < 1:
-        list_files_process.clear()
         return gr.Slider(value=1, maximum=1, info='0:00:00'), ''
-    
+
     for f in destfiles:
         list_files_process.append(ProcessEntry(f.name, 0,0, 0))
 
