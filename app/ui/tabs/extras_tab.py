@@ -22,6 +22,8 @@ frame_upscalers_map = {
     "LSDIR x4" : {"upscale" : {"subtype": "lsdirx4"}}
 }
 
+RESOLUTION_CHOICES = ["1280x720", "1920x1080", "854x480", "3840x2160"]
+
 def extras_tab():
     filternames = ["None"]
     for f in frame_filters_map.keys():
@@ -50,6 +52,13 @@ def extras_tab():
                         start_cut_video = gr.Button("Cut video")
                         start_extract_frames = gr.Button("Extract frames")
                         start_join_videos = gr.Button("Join videos")
+                with gr.Row(variant='panel'):
+                    with gr.Column():
+                        gr.Markdown("# Resize video\nScales to the target resolution, preserving aspect ratio (letterbox).")
+                    with gr.Column():
+                        resize_resolution = gr.Dropdown(RESOLUTION_CHOICES, value="1280x720", label="Target resolution", interactive=True)
+                    with gr.Column():
+                        start_resize_video = gr.Button("Resize video")
 
                 with gr.Row(variant='panel'):
                     with gr.Column():
@@ -88,9 +97,25 @@ def extras_tab():
     start_cut_video.click(fn=on_cut_video, inputs=[files_to_process, cut_start_time, cut_end_time, extras_chk_encode], outputs=[extra_files_output])
     start_extract_frames.click(fn=on_extras_extract_frames, inputs=[files_to_process], outputs=[extra_files_output])
     start_join_videos.click(fn=on_join_videos, inputs=[files_to_process, extras_chk_encode], outputs=[extra_files_output])
+    start_resize_video.click(fn=on_resize_video, inputs=[files_to_process, resize_resolution], outputs=[extra_files_output])
     extras_create_video.click(fn=on_extras_create_video, inputs=[files_to_process, extras_images_folder, extras_fps, extras_chk_creategif], outputs=[extra_files_output])
     extras_create_video_from_gif.click(fn=on_extras_create_video_from_gif, inputs=[files_to_process, extras_video_fps], outputs=[extra_files_output])
     start_frame_process.click(fn=on_frame_process, inputs=[files_to_process, filterselection, upscalerselection], outputs=[extra_files_output])
+
+
+def on_resize_video(files, resolution):
+    if files is None:
+        return None
+    width, height = (int(x) for x in resolution.split('x'))
+    resultfiles = []
+    for tf in files:
+        f = tf.name
+        destfile = util.get_destfilename_from_path(f, roop.globals.output_path, f'_{width}x{height}')
+        if ffmpeg.resize_video(f, destfile, width, height):
+            resultfiles.append(destfile)
+        else:
+            gr.Error(f'Resizing {os.path.basename(f)} failed!')
+    return resultfiles
 
 
 def on_cut_video(files, cut_start_frame, cut_end_frame, reencode):
