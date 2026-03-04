@@ -99,6 +99,16 @@ def extras_tab(bt_destfiles=None):
     output_path_state = gr.State(None)
 
     # ── Event wiring ──────────────────────────────────────────────────
+    files_to_process.clear(
+        fn=on_file_clear,
+        outputs=[
+            preview_image, preview_video,
+            output_image, output_video,
+            output_path_state,
+        ],
+        show_progress="hidden",
+    )
+
     files_to_process.upload(
         fn=on_file_upload,
         inputs=[files_to_process],
@@ -133,6 +143,11 @@ def extras_tab(bt_destfiles=None):
 
 
 # ── Handlers ──────────────────────────────────────────────────────────
+
+def on_file_clear():
+    hidden = gr.update(visible=False, value=None)
+    return hidden, hidden, hidden, hidden, None
+
 
 def on_file_upload(files):
     empty = (
