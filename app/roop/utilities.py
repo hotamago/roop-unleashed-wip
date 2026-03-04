@@ -42,6 +42,23 @@ def detect_fps(target_path: str) -> float:
     return fps
 
 
+def detect_dimensions(target_path: str):
+    """Returns (width, height) for images and videos. Returns (0, 0) on failure."""
+    if is_image(target_path):
+        img = cv2.imread(target_path)
+        if img is not None:
+            return img.shape[1], img.shape[0]
+        return 0, 0
+    cap = cv2.VideoCapture(target_path)
+    if cap.isOpened():
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return w, h
+    cap.release()
+    return 0, 0
+
+
 # Gradio wants Images in RGB
 def convert_to_gradio(image):
     if image is None:

@@ -48,8 +48,8 @@ def faceswap_tab():
         with gr.Row(variant='panel'):
             with gr.Column(scale=2):
                 with gr.Row():
-                    input_faces = gr.Gallery(label="Input faces gallery", allow_preview=False, preview=False, height=138, columns=64, object_fit="scale-down", interactive=False)
-                    target_faces = gr.Gallery(label="Target faces gallery", allow_preview=False, preview=False, height=138, columns=64, object_fit="scale-down", interactive=False)
+                    input_faces = gr.Gallery(label="Input faces gallery", allow_preview=False, preview=False, height=200, columns=64, object_fit="contain", interactive=False)
+                    target_faces = gr.Gallery(label="Target faces gallery", allow_preview=False, preview=False, height=200, columns=64, object_fit="contain", interactive=False)
                 with gr.Row():
                     bt_move_left_input = gr.Button("⬅ Move left", size='sm')
                     bt_move_right_input = gr.Button("➡ Move right", size='sm')

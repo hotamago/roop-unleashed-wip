@@ -1,251 +1,260 @@
 import os
 import gradio as gr
-import shutil
 import roop.utilities as util
 import roop.util_ffmpeg as ffmpeg
 import roop.globals
 
-frame_filters_map = { 
-    "Colorize B/W Images (Deoldify Artistic)" : {"colorizer" : {"subtype": "deoldify_artistic"}},
-    "Colorize B/W Images (Deoldify Stable)" : {"colorizer" : {"subtype": "deoldify_stable"}},
-    "Background remove" : {"removebg" : {"subtype": ""}},
-    "Filter Stylize" : {"filter_generic" : {"subtype" : "stylize" }},
-    "Filter Detail Enhance" : {"filter_generic" : {"subtype" : "detailenhance" }},
-    "Filter Pencil Sketch" : {"filter_generic" : {"subtype" : "pencil" }},
-    "Filter Cartoon" : {"filter_generic" : {"subtype" : "cartoon" }},
-    "Filter C64" : {"filter_generic" : {"subtype" : "C64" }}
-    }
-
-frame_upscalers_map = {
-    "ESRGAN x2" : {"upscale" : {"subtype": "esrganx2"}},
-    "ESRGAN x4" : {"upscale" : {"subtype": "esrganx4"}},
-    "LSDIR x4" : {"upscale" : {"subtype": "lsdirx4"}}
+RESOLUTION_CHOICES = ["1280x720", "1920x1080", "854x480", "3840x2160"]
+ROTATION_CHOICES   = [
+    "None (no change)",
+    "90° Clockwise", "90° Counter-clockwise",
+    "180°",
+    "Flip Horizontal", "Flip Vertical",
+]
+ROTATE_FILTERS = {
+    "90° Clockwise":        ["transpose=1"],
+    "90° Counter-clockwise": ["transpose=2"],
+    "180°":                  ["vflip", "hflip"],
+    "Flip Horizontal":       ["hflip"],
+    "Flip Vertical":         ["vflip"],
 }
 
-RESOLUTION_CHOICES = ["1280x720", "1920x1080", "854x480", "3840x2160"]
 
 def extras_tab(bt_destfiles=None):
-    filternames = ["None"]
-    for f in frame_filters_map.keys():
-        filternames.append(f)
-    upscalernames = ["None"]
-    for f in frame_upscalers_map.keys():
-        upscalernames.append(f)
+    # State: tracks detected properties of the current file
+    file_info = gr.State({"width": 0, "height": 0, "fps": 24.0, "is_video": False})
 
     with gr.Tab("🎉 Extras"):
+
+        # ── Upload + Preview ──────────────────────────────────────────
         with gr.Row():
-            files_to_process = gr.Files(label='File(s) to process', file_count="multiple", file_types=["image", "video"])
-        with gr.Row(variant='panel'):
-            with gr.Accordion(label="Video/GIF", open=False):
-                with gr.Row(variant='panel'):
-                    with gr.Column():
-                        gr.Markdown("""
-                                    # Poor man's video editor
-                                    Re-encoding uses your configuration from the Settings Tab.
-    """)
-                    with gr.Column():
-                        cut_start_time = gr.Slider(0, 1000000, value=0, label="Start Frame", step=1.0, interactive=True)
-                    with gr.Column():
-                        cut_end_time = gr.Slider(1, 1000000, value=1, label="End Frame", step=1.0, interactive=True)
-                    with gr.Column():
-                        extras_chk_encode = gr.Checkbox(label='Re-encode videos (necessary for videos with different codecs)', value=False)
-                        start_cut_video = gr.Button("Cut video")
-                        start_extract_frames = gr.Button("Extract frames")
-                        start_join_videos = gr.Button("Join videos")
-                with gr.Row(variant='panel'):
-                    with gr.Column():
-                        gr.Markdown("# Resize video\nScales to the target resolution, preserving aspect ratio (letterbox).")
-                    with gr.Column():
-                        resize_resolution = gr.Dropdown(RESOLUTION_CHOICES, value="1280x720", label="Target resolution", interactive=True)
-                    with gr.Column():
-                        start_resize_video = gr.Button("Resize video")
+            with gr.Column(scale=1):
+                files_to_process = gr.Files(
+                    label="Upload file",
+                    file_count="multiple",
+                    file_types=["image", "video"],
+                )
+            with gr.Column(scale=2):
+                preview_image = gr.Image(
+                    label="Preview", visible=False, interactive=False,
+                    show_download_button=False,
+                )
+                preview_video = gr.Video(
+                    label="Preview", visible=False, interactive=False,
+                )
 
-                with gr.Row(variant='panel'):
-                    with gr.Column():
-                        gr.Markdown("""
-                                    # Create video/gif from images
-    """)
-                    with gr.Column():
-                        extras_fps = gr.Slider(minimum=0, maximum=120, value=30, label="Video FPS", step=1.0, interactive=True)
-                        extras_images_folder = gr.Textbox(show_label=False, placeholder="/content/", interactive=True)
-                    with gr.Column():
-                        extras_chk_creategif = gr.Checkbox(label='Create GIF from video', value=False)
-                        extras_create_video=gr.Button("Create")
-                with gr.Row(variant='panel'):
-                    with gr.Column():
-                        gr.Markdown("""
-                                    # Create video from gif
-    """)
-                    with gr.Column():
-                        extras_video_fps = gr.Slider(minimum=0, maximum=120, value=0, label="Video FPS", step=1.0, interactive=True)
-                    with gr.Column():
-                        extras_create_video_from_gif=gr.Button("Create")
+        # ── Operations ────────────────────────────────────────────────
+        with gr.Row(equal_height=True):
+            with gr.Group():
+                gr.Markdown("#### Resolution")
+                current_res_label = gr.Markdown("**Current:** —")
+                resize_resolution = gr.Dropdown(
+                    RESOLUTION_CHOICES, value=RESOLUTION_CHOICES[0],
+                    label="Target", show_label=False,
+                )
 
-        with gr.Row(variant='panel'):
-            with gr.Accordion(label="Full frame processing", open=True):
-                with gr.Row(variant='panel'):
-                    filterselection = gr.Dropdown(filternames, value="None", label="Colorizer/FilterFX", interactive=True)
-                    upscalerselection = gr.Dropdown(upscalernames, value="None", label="Enhancer", interactive=True)
-                with gr.Row(variant='panel'):
-                    start_frame_process=gr.Button("Start processing")
+            with gr.Group():
+                gr.Markdown("#### Rotate / Flip")
+                rotation_choice = gr.Dropdown(
+                    ROTATION_CHOICES, value="None (no change)",
+                    label="Transform", show_label=False,
+                )
+
+            with gr.Group(visible=False) as fps_group:
+                gr.Markdown("#### Change FPS")
+                current_fps_label = gr.Markdown("**Current:** —")
+                fps_value = gr.Slider(1, 120, value=30, step=1,
+                                      label="Target FPS", show_label=False)
+
+        # ── Crop ──────────────────────────────────────────────────────
+        with gr.Group():
+            gr.Markdown("#### Crop  *(trim from each edge as % of frame size)*")
+            with gr.Row():
+                crop_left   = gr.Slider(0, 49, value=0, step=1, label="Left %")
+                crop_right  = gr.Slider(0, 49, value=0, step=1, label="Right %")
+                crop_top    = gr.Slider(0, 49, value=0, step=1, label="Top %")
+                crop_bottom = gr.Slider(0, 49, value=0, step=1, label="Bottom %")
+
+        # ── Single Apply ──────────────────────────────────────────────
+        with gr.Row():
+            btn_apply = gr.Button("Apply", variant="primary")
+
+        # ── Output preview ────────────────────────────────────────────
+        with gr.Row():
+            output_image = gr.Image(
+                label="Output", visible=False, interactive=False,
+                show_download_button=True,
+            )
+            output_video = gr.Video(
+                label="Output", visible=False, interactive=False,
+            )
 
         with gr.Row():
-            gr.Button("👀 Open Output Folder", size='sm').click(fn=lambda: util.open_folder(roop.globals.output_path))
-            send_to_faceswap_btn = gr.Button("↗ Send to Face Swap", size='sm', visible=bt_destfiles is not None)
-        with gr.Row():
-            extra_files_output = gr.Files(label='Resulting output files', file_count="multiple")
+            send_to_faceswap_btn = gr.Button(
+                "↗ Send to Face Swap", size="sm",
+                visible=bt_destfiles is not None,
+            )
 
-    start_cut_video.click(fn=on_cut_video, inputs=[files_to_process, cut_start_time, cut_end_time, extras_chk_encode], outputs=[extra_files_output])
-    start_extract_frames.click(fn=on_extras_extract_frames, inputs=[files_to_process], outputs=[extra_files_output])
-    start_join_videos.click(fn=on_join_videos, inputs=[files_to_process, extras_chk_encode], outputs=[extra_files_output])
-    start_resize_video.click(fn=on_resize_video, inputs=[files_to_process, resize_resolution], outputs=[extra_files_output])
-    extras_create_video.click(fn=on_extras_create_video, inputs=[files_to_process, extras_images_folder, extras_fps, extras_chk_creategif], outputs=[extra_files_output])
-    extras_create_video_from_gif.click(fn=on_extras_create_video_from_gif, inputs=[files_to_process, extras_video_fps], outputs=[extra_files_output])
-    start_frame_process.click(fn=on_frame_process, inputs=[files_to_process, filterselection, upscalerselection], outputs=[extra_files_output])
+    # Holds the output path(s) for Send to Face Swap
+    output_path_state = gr.State(None)
+
+    # ── Event wiring ──────────────────────────────────────────────────
+    files_to_process.clear(
+        fn=on_file_clear,
+        outputs=[
+            preview_image, preview_video,
+            output_image, output_video,
+            output_path_state,
+        ],
+        show_progress="hidden",
+    )
+
+    files_to_process.upload(
+        fn=on_file_upload,
+        inputs=[files_to_process],
+        outputs=[
+            preview_image, preview_video,
+            current_res_label, resize_resolution,
+            current_fps_label, fps_value,
+            fps_group,
+            file_info,
+        ],
+        show_progress="hidden",
+    )
+
+    btn_apply.click(
+        fn=on_apply_all,
+        inputs=[
+            files_to_process,
+            resize_resolution, rotation_choice,
+            fps_value,
+            crop_left, crop_right, crop_top, crop_bottom,
+            file_info,
+        ],
+        outputs=[output_image, output_video, output_path_state],
+    )
+
     if bt_destfiles is not None:
-        send_to_faceswap_btn.click(fn=on_send_to_faceswap, inputs=[extra_files_output], outputs=[bt_destfiles])
+        send_to_faceswap_btn.click(
+            fn=on_send_to_faceswap,
+            inputs=[output_path_state],
+            outputs=[bt_destfiles],
+        )
 
 
-def on_resize_video(files, resolution):
-    if files is None:
+# ── Handlers ──────────────────────────────────────────────────────────
+
+def on_file_clear():
+    hidden = gr.update(visible=False, value=None)
+    return hidden, hidden, hidden, hidden, None
+
+
+def on_file_upload(files):
+    empty = (
+        gr.update(visible=False, value=None),
+        gr.update(visible=False, value=None),
+        gr.update(value="**Current:** —"),
+        gr.update(choices=RESOLUTION_CHOICES, value=RESOLUTION_CHOICES[0]),
+        gr.update(value="**Current:** —"),
+        gr.update(value=30),
+        gr.update(visible=False),
+        {"width": 0, "height": 0, "fps": 24.0, "is_video": False},
+    )
+    if not files:
+        return empty
+
+    path = files[0].name if hasattr(files[0], 'name') else str(files[0])
+    is_img = util.is_image(path)
+    is_vid = util.is_video(path)
+
+    if not is_img and not is_vid:
+        return empty
+
+    # Detect properties
+    w, h = util.detect_dimensions(path)
+    fps   = util.detect_fps(path) if is_vid else 24.0
+
+    # Build resolution dropdown choices with current res at top
+    current_res = f"{w}x{h}" if w and h else RESOLUTION_CHOICES[0]
+    choices = [current_res] + [r for r in RESOLUTION_CHOICES if r != current_res]
+
+    info = {"width": w, "height": h, "fps": fps, "is_video": is_vid}
+
+    return (
+        gr.update(visible=is_img, value=path if is_img else None),
+        gr.update(visible=is_vid, value=path if is_vid else None),
+        gr.update(value=f"**Current:** {w} × {h}"),
+        gr.update(choices=choices, value=current_res),
+        gr.update(value=f"**Current:** {fps:.2f} fps"),
+        gr.update(value=round(fps)),
+        gr.update(visible=is_vid),
+        info,
+    )
+
+
+def on_apply_all(files, resolution, rotation, fps,
+                 crop_left, crop_right, crop_top, crop_bottom,
+                 file_info):
+    if not files:
         return None
-    width, height = (int(x) for x in resolution.split('x'))
-    resultfiles = []
-    for tf in files:
-        f = tf.name
-        destfile = util.get_destfilename_from_path(f, roop.globals.output_path, f'_{width}x{height}')
-        if ffmpeg.resize_video(f, destfile, width, height):
-            resultfiles.append(destfile)
+
+    paths = [f.name if hasattr(f, 'name') else str(f) for f in files]
+    is_vid = file_info.get("is_video", False)
+    cur_w  = file_info.get("width", 0)
+    cur_h  = file_info.get("height", 0)
+    cur_fps = file_info.get("fps", 24.0)
+
+    # Build vf filter list (order: crop → rotate → scale → fps)
+    filters = []
+
+    if any(v > 0 for v in [crop_left, crop_right, crop_top, crop_bottom]):
+        l, r, t, b = crop_left/100, crop_right/100, crop_top/100, crop_bottom/100
+        filters.append(
+            f"crop=in_w*(1-{l:.4f}-{r:.4f}):in_h*(1-{t:.4f}-{b:.4f})"
+            f":in_w*{l:.4f}:in_h*{t:.4f}"
+        )
+
+    if rotation in ROTATE_FILTERS:
+        filters.extend(ROTATE_FILTERS[rotation])
+
+    target_w, target_h = (int(x) for x in resolution.split('x'))
+    if target_w != cur_w or target_h != cur_h:
+        filters.append(
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+        )
+
+    if is_vid and abs(fps - cur_fps) > 0.1:
+        filters.append(f"fps={fps}")
+
+    no_output = (
+        gr.update(visible=False, value=None),
+        gr.update(visible=False, value=None),
+        None,
+    )
+
+    if not filters:
+        gr.Info("No changes to apply.")
+        return no_output
+
+    out = []
+    for f in paths:
+        dest = util.get_destfilename_from_path(f, roop.globals.output_path, '_edited')
+        if ffmpeg.apply_media_transforms(f, dest, filters, is_vid):
+            out.append(dest)
         else:
-            gr.Error(f'Resizing {os.path.basename(f)} failed!')
-    return resultfiles
+            gr.Warning(f'Processing failed for {os.path.basename(f)}')
+
+    if not out:
+        return no_output
+
+    first = out[0]
+    if util.is_image(first):
+        return gr.update(visible=True, value=first), gr.update(visible=False, value=None), out
+    return gr.update(visible=False, value=None), gr.update(visible=True, value=first), out
 
 
-def on_cut_video(files, cut_start_frame, cut_end_frame, reencode):
-    if files is None:
+def on_send_to_faceswap(paths):
+    if not paths:
         return None
-    
-    resultfiles = []
-    for tf in files:
-        f = tf.name
-        destfile = util.get_destfilename_from_path(f, roop.globals.output_path, '_cut')
-        ffmpeg.cut_video(f, destfile, cut_start_frame, cut_end_frame, reencode)
-        if os.path.isfile(destfile):
-            resultfiles.append(destfile)
-        else:
-            gr.Error('Cutting video failed!')
-    return resultfiles
-
-
-def on_join_videos(files, chk_encode):
-    if files is None:
-        return None
-    
-    filenames = []
-    for f in files:
-        filenames.append(f.name)
-    destfile = util.get_destfilename_from_path(filenames[0], roop.globals.output_path, '_join')
-    sorted_filenames = util.sort_filenames_ignore_path(filenames)        
-    ffmpeg.join_videos(sorted_filenames, destfile, not chk_encode)
-    resultfiles = []
-    if os.path.isfile(destfile):
-        resultfiles.append(destfile)
-    else:
-        gr.Error('Joining videos failed!')
-    return resultfiles
-
-def on_extras_create_video_from_gif(files,fps):
-    if files is None:
-        return None
-    
-    filenames = []
-    resultfiles = []
-    for f in files:
-        filenames.append(f.name)
-
-    destfilename = os.path.join(roop.globals.output_path, "img2video." + roop.globals.CFG.output_video_format)
-    ffmpeg.create_video_from_gif(filenames[0], destfilename)
-    if os.path.isfile(destfilename):
-        resultfiles.append(destfilename)
-    return resultfiles
-
-
-
-
-
-def on_extras_create_video(files, images_path,fps, create_gif):
-    if images_path is None:
-        return None
-    resultfiles = []
-    if len(files) > 0 and util.is_video(files[0]) and create_gif:
-        destfilename = files[0]
-    else:                     
-        util.sort_rename_frames(os.path.dirname(images_path))
-        destfilename = os.path.join(roop.globals.output_path, "img2video." + roop.globals.CFG.output_video_format)
-        ffmpeg.create_video('', destfilename, fps, images_path)
-        if os.path.isfile(destfilename):
-            resultfiles.append(destfilename)
-        else:
-            return None
-    if create_gif:
-        gifname = util.get_destfilename_from_path(destfilename, './output', '.gif')
-        ffmpeg.create_gif_from_video(destfilename, gifname)
-        if os.path.isfile(destfilename):
-            resultfiles.append(gifname)
-    return resultfiles
-    
-
-def on_extras_extract_frames(files):
-    if files is None:
-        return None
-    
-    resultfiles = []
-    for tf in files:
-        f = tf.name
-        resfolder = ffmpeg.extract_frames(f)
-        for file in os.listdir(resfolder):
-            outfile = os.path.join(resfolder, file)
-            if os.path.isfile(outfile):
-                resultfiles.append(outfile)
-    return resultfiles
-
-
-def on_send_to_faceswap(files):
-    if files is None:
-        return None
-    return [f.name for f in files]
-
-
-def on_frame_process(files, filterselection, upscaleselection):
-    import pathlib
-    from roop.core import batch_process_with_options
-    from roop.ProcessEntry import ProcessEntry
-    from roop.ProcessOptions import ProcessOptions
-    from ui.main import prepare_environment
-
-
-    if files is None:
-        return None
-
-    if roop.globals.CFG.clear_output:
-        shutil.rmtree(roop.globals.output_path)
-    prepare_environment()
-    list_files_process : list[ProcessEntry] = []
-
-    for tf in files:
-        list_files_process.append(ProcessEntry(tf.name, 0,0, 0))
-
-    processoroptions = {}
-    filter = next((x for x in frame_filters_map.keys() if x == filterselection), None)
-    if filter is not None:
-        processoroptions.update(frame_filters_map[filter])
-    filter = next((x for x in frame_upscalers_map.keys() if x == upscaleselection), None)
-    if filter is not None:
-        processoroptions.update(frame_upscalers_map[filter])
-    options = ProcessOptions(processoroptions, 0,  0, "all", 0, None, None, 0, 128, False, False)
-    batch_process_with_options(list_files_process, options, None)
-    outdir = pathlib.Path(roop.globals.output_path)
-    outfiles = [str(item) for item in outdir.rglob("*") if item.is_file()]
-    return outfiles
-
-
+    return paths
