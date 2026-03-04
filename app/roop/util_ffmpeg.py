@@ -109,6 +109,36 @@ def resize_video(input_path: str, output_path: str, width: int, height: int) -> 
                        '-c:a', 'copy', output_path])
 
 
+def rotate_media(input_path: str, output_path: str, transform: str) -> bool:
+    transform_map = {
+        "90° Clockwise":        "transpose=1",
+        "90° Counter-clockwise": "transpose=2",
+        "180°":                  "transpose=1,transpose=1",
+        "Flip Horizontal":       "hflip",
+        "Flip Vertical":         "vflip",
+    }
+    vf = transform_map.get(transform, "transpose=1")
+    return run_ffmpeg(['-i', input_path, '-vf', vf, '-c:a', 'copy', output_path])
+
+
+def change_fps(input_path: str, output_path: str, fps: float) -> bool:
+    return run_ffmpeg(['-i', input_path, '-vf', f'fps={fps}',
+                       '-c:v', roop.globals.video_encoder,
+                       '-crf', str(roop.globals.video_quality),
+                       '-c:a', 'copy', output_path])
+
+
+def crop_media(input_path: str, output_path: str,
+               left_pct: float, right_pct: float,
+               top_pct: float,  bottom_pct: float) -> bool:
+    l, r, t, b = left_pct / 100, right_pct / 100, top_pct / 100, bottom_pct / 100
+    crop_filter = (
+        f"crop=in_w*(1-{l:.4f}-{r:.4f}):in_h*(1-{t:.4f}-{b:.4f})"
+        f":in_w*{l:.4f}:in_h*{t:.4f}"
+    )
+    return run_ffmpeg(['-i', input_path, '-vf', crop_filter, '-c:a', 'copy', output_path])
+
+
 def restore_audio(intermediate_video: str, original_video: str, trim_frame_start, trim_frame_end, final_video : str) -> None:
 	fps = util.detect_fps(original_video)
 	commands = [ '-i', intermediate_video ]
