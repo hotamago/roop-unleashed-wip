@@ -601,11 +601,8 @@ class ProcessMgr():
         face_matte = face_matte.astype(np.float32) / 255
         img_matte = np.minimum(face_matte, img_matte)
 
-        if self.options.show_face_area_overlay:
-            green_overlay = np.zeros_like(target_img)
-            green_color = [0, 255, 0]
-            for i in range(3):
-                green_overlay[:, :, i] = np.where(img_matte > 0, green_color[i], 0)
+        # Save 2D mask before reshape so overlay can use gradient values
+        mask_2d = img_matte if self.options.show_face_area_overlay else None
 
         img_matte = np.reshape(img_matte, [img_matte.shape[0], img_matte.shape[1], 1])
         paste_face = cv2.warpAffine(upsk_face, IM, (target_img.shape[1], target_img.shape[0]), borderMode=cv2.BORDER_REPLICATE)
@@ -615,8 +612,16 @@ class ProcessMgr():
 
         paste_face = img_matte * paste_face
         paste_face = paste_face + (1 - img_matte) * target_img.astype(np.float32)
+
         if self.options.show_face_area_overlay:
-            paste_face = cv2.addWeighted(paste_face.astype(np.uint8), 1 - 0.5, green_overlay, 0.5, 0)
+            # Gradient overlay: green in the core (mask≈1), yellow/orange at the
+            # edge blend zone (mask≈0.5), invisible outside (mask≈0).
+            # G channel scales with mask strength; R channel peaks mid-transition.
+            overlay = np.zeros_like(target_img, dtype=np.uint8)
+            overlay[:, :, 1] = (mask_2d * 200).astype(np.uint8)
+            overlay[:, :, 2] = np.clip((1.0 - mask_2d) * mask_2d * 4 * 255, 0, 255).astype(np.uint8)
+            paste_face = cv2.addWeighted(paste_face.astype(np.uint8), 0.6, overlay, 0.4, 0)
+
         return paste_face.astype(np.uint8)
 
 
