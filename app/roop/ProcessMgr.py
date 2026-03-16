@@ -843,14 +843,20 @@ class ProcessMgr():
         return frame
 
     def apply_color_transfer(self, source, target):
+        # If source is effectively grayscale (B&W media), skip color transfer.
+        # Chrominance std ≈ 0 causes division explosion → blue artifact.
+        src_f = source.astype(np.float32)
+        if (np.mean(np.abs(src_f[:, :, 0] - src_f[:, :, 1])) < 5 and
+                np.mean(np.abs(src_f[:, :, 1] - src_f[:, :, 2])) < 5):
+            return source
         source = cv2.cvtColor(source, cv2.COLOR_BGR2LAB).astype("float32")
         target = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype("float32")
         source_mean, source_std = cv2.meanStdDev(source)
         target_mean, target_std = cv2.meanStdDev(target)
         source_mean = source_mean.reshape(1, 1, 3)
-        source_std = source_std.reshape(1, 1, 3)
+        source_std  = np.maximum(source_std.reshape(1, 1, 3), 1.0)  # guard near-zero
         target_mean = target_mean.reshape(1, 1, 3)
-        target_std = target_std.reshape(1, 1, 3)
+        target_std  = target_std.reshape(1, 1, 3)
         source = (source - source_mean) * (target_std / source_std) + target_mean
         return cv2.cvtColor(np.clip(source, 0, 255).astype("uint8"), cv2.COLOR_LAB2BGR)
 
