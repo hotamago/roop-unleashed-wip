@@ -89,7 +89,7 @@ def hash_target_faces(target_faces):
     return hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest()
 
 
-PIPELINE_VERSION = 4
+PIPELINE_VERSION = 5
 
 
 def get_entry_signature(entry, options, output_method):
@@ -425,13 +425,11 @@ class StagedBatchExecutor:
         fps = entry.fps or util.detect_fps(entry.filename)
         frame_count = max(endframe - entry.startframe, 1)
         stages = merge_stage_defaults(manifest.get("stages"), {
-            "extract": False,
             "detect": False,
             "swap": False,
             "mask": self.mask_name is None,
             "enhance": self.enhancer_name is None,
             "composite": False,
-            "encode": False,
         })
         manifest["stages"] = stages
         manifest["frame_count"] = frame_count
@@ -439,22 +437,13 @@ class StagedBatchExecutor:
         self.current_total_chunks = None
         self.current_chunk_index = None
 
-        frames_dir = job_dir / "source_frames"
         detect_dir = job_dir / "detect"
         swap_dir = job_dir / "swap"
         mask_dir = job_dir / "mask"
         enhance_dir = job_dir / "enhance"
-        rendered_dir = job_dir / "rendered"
         intermediate_video = job_dir / "intermediate.mp4"
 
-        frame_paths = self.ensure_full_extract_stage(entry, frames_dir, frame_count, fps, endframe, stages, manifest)
-        if not roop.globals.processing:
-            manifest["status"] = "interrupted"
-            write_json(job_dir / "manifest.json", manifest)
-            return
-        manifest["frame_count"] = len(frame_paths)
-
-        task_count = self.ensure_full_detect_stage(frame_paths, entry, detect_dir, stages, manifest)
+        task_count = self.ensure_full_detect_stage(entry, endframe, detect_dir, stages, manifest, memory_plan)
         manifest["task_count"] = task_count
         write_json(job_dir / "manifest.json", manifest)
         if not roop.globals.processing:
@@ -480,36 +469,16 @@ class StagedBatchExecutor:
             write_json(job_dir / "manifest.json", manifest)
             return
 
-        self.ensure_full_compose_stage(frame_paths, detect_dir, swap_dir, mask_dir, enhance_dir, rendered_dir, stages, manifest)
+        self.ensure_full_compose_stage(entry, endframe, fps, detect_dir, swap_dir, mask_dir, enhance_dir, intermediate_video, stages, manifest, memory_plan)
         if not roop.globals.processing:
             manifest["status"] = "interrupted"
             write_json(job_dir / "manifest.json", manifest)
             return
 
-        self.ensure_full_encode_stage(entry, index, rendered_dir, intermediate_video, len(frame_paths), fps, endframe, stages, manifest)
+        self.ensure_full_encode_stage(entry, index, intermediate_video, manifest.get("frame_count", frame_count), endframe)
         manifest["status"] = "completed"
         write_json(job_dir / "manifest.json", manifest)
         self.cleanup_job_dir(job_dir)
-
-
-    def ensure_full_extract_stage(self, entry, frames_dir, frame_count, fps, endframe, stages, manifest):
-        image_format = roop.globals.CFG.output_image_format
-        frame_paths = list_stage_images(frames_dir, image_format)
-        if stages["extract"] and len(frame_paths) == frame_count:
-            self.update_progress("extract", detail="Reusing extracted source frames", step_completed=frame_count, step_total=frame_count, step_unit="frames", force_log=True)
-            return [str(path) for path in frame_paths]
-
-        if frames_dir.exists():
-            shutil.rmtree(frames_dir, ignore_errors=True)
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        self.update_progress("extract", detail="Extracting full frame range with ffmpeg", step_completed=0, step_total=frame_count, step_unit="frames", force_log=True)
-        ffmpeg.extract_frames(entry.filename, entry.startframe, endframe, fps, str(frames_dir), image_format)
-        frame_paths = list_stage_images(frames_dir, image_format)
-        stages["extract"] = len(frame_paths) > 0
-        manifest["frame_count"] = len(frame_paths)
-        write_json(frames_dir.parent / "manifest.json", manifest)
-        self.update_progress("extract", detail="Finished ffmpeg frame extraction", step_completed=len(frame_paths), step_total=max(len(frame_paths), 1), step_unit="frames", force_log=True)
-        return [str(path) for path in frame_paths]
 
 
     def get_detect_plan_path(self, detect_dir, seq_index):
@@ -536,30 +505,38 @@ class StagedBatchExecutor:
         return total_tasks
 
 
-    def ensure_full_detect_stage(self, frame_paths, entry, detect_dir, stages, manifest):
+    def ensure_full_detect_stage(self, entry, endframe, detect_dir, stages, manifest, memory_plan):
         plans_dir = detect_dir / "plans"
         aligned_dir = detect_dir / "aligned"
         plans_dir.mkdir(parents=True, exist_ok=True)
         aligned_dir.mkdir(parents=True, exist_ok=True)
+        frame_count = max(endframe - entry.startframe, 1)
+        if stages["detect"]:
+            plan_count = len(list(plans_dir.glob("*.json")))
+            if plan_count >= frame_count:
+                task_count = self.compute_task_count(detect_dir, frame_count)
+                manifest["frame_count"] = frame_count
+                manifest["task_count"] = task_count
+                self.update_progress("detect", detail="Reusing detect cache", step_completed=frame_count, step_total=frame_count, step_unit="frames", force_log=True)
+                return task_count
         planner = ProcessMgr(None)
         planner.initialize(roop.globals.INPUT_FACESETS, roop.globals.TARGET_FACES, self.build_stage_options([]))
         processed_frames = 0
         total_tasks = 0
-        total_frames = len(frame_paths)
         try:
-            for seq_index, frame_path in enumerate(frame_paths, start=1):
+            for frame_number, frame in iter_video_chunk(entry.filename, entry.startframe, endframe, memory_plan["prefetch_frames"]):
+                seq_index = (frame_number - entry.startframe) + 1
                 plan_path = self.get_detect_plan_path(detect_dir, seq_index)
                 if plan_path.exists():
                     frame_meta = read_json(plan_path)
                     total_tasks += len(frame_meta["tasks"])
                     processed_frames += 1
-                    self.update_progress("detect", detail="Reusing detect cache", step_completed=processed_frames, step_total=total_frames, step_unit="frames")
+                    self.update_progress("detect", detail="Reusing detect cache", step_completed=processed_frames, step_total=frame_count, step_unit="frames")
                     continue
 
-                frame = read_image(Path(frame_path))
                 frame_plan = planner.build_frame_plan(frame)
                 frame_meta = {
-                    "frame_number": entry.startframe + seq_index - 1,
+                    "frame_number": frame_number,
                     "sequence": seq_index,
                     "fallback": frame_plan["fallback"],
                     "tasks": [],
@@ -575,12 +552,14 @@ class StagedBatchExecutor:
                 write_json(plan_path, frame_meta)
                 total_tasks += len(frame_meta["tasks"])
                 processed_frames += 1
-                self.update_progress("detect", detail="Detecting and aligning faces", step_completed=processed_frames, step_total=total_frames, step_unit="frames")
+                self.update_progress("detect", detail="Streaming source decode + face detection", step_completed=processed_frames, step_total=frame_count, step_unit="frames")
+                manifest["frame_count"] = processed_frames
                 manifest["task_count"] = total_tasks
                 write_json(detect_dir.parent / "manifest.json", manifest)
         finally:
             planner.release_resources()
         stages["detect"] = True
+        manifest["frame_count"] = processed_frames
         return total_tasks
 
 
@@ -763,23 +742,27 @@ class StagedBatchExecutor:
         self.update_progress("enhance", detail="Running enhancement stage", step_completed=processed_tasks + len(task_batch), step_total=task_count, step_unit="faces")
 
 
-    def ensure_full_compose_stage(self, frame_paths, detect_dir, swap_dir, mask_dir, enhance_dir, rendered_dir, stages, manifest):
-        rendered_dir.mkdir(parents=True, exist_ok=True)
-        frame_count = len(frame_paths)
+    def ensure_full_compose_stage(self, entry, endframe, fps, detect_dir, swap_dir, mask_dir, enhance_dir, intermediate_video, stages, manifest, memory_plan):
+        frame_count = manifest.get("frame_count", max(endframe - entry.startframe, 1))
+        if stages["composite"] and intermediate_video.exists():
+            self.completed_units += frame_count
+            self.update_progress("composite", detail="Reusing encoded composite video cache", step_completed=frame_count, step_total=frame_count, step_unit="frames", force_log=True)
+            return
+        if intermediate_video.exists():
+            os.remove(str(intermediate_video))
         compose_mgr = ProcessMgr(None)
         compose_mgr.initialize(roop.globals.INPUT_FACESETS, roop.globals.TARGET_FACES, self.build_stage_options([]))
         input_dir = mask_dir if self.mask_name else swap_dir
         fallback_mgr = None
         processed_frames = 0
+        cap = cv2.VideoCapture(entry.filename)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        writer = FFMPEG_VideoWriter(str(intermediate_video), (width, height), fps, codec=roop.globals.video_encoder, crf=roop.globals.video_quality)
         try:
-            for seq_index, frame_path in enumerate(frame_paths, start=1):
-                render_path = rendered_dir / f"{seq_index:06d}.{roop.globals.CFG.output_image_format}"
-                if render_path.exists():
-                    self.completed_units += 1
-                    processed_frames += 1
-                    self.update_progress("composite", detail="Reusing composed frame cache", step_completed=processed_frames, step_total=frame_count, step_unit="frames")
-                    continue
-                frame = read_image(Path(frame_path))
+            for frame_number, frame in iter_video_chunk(entry.filename, entry.startframe, endframe, memory_plan["prefetch_frames"]):
+                seq_index = (frame_number - entry.startframe) + 1
                 frame_meta = read_json(self.get_detect_plan_path(detect_dir, seq_index))
                 if frame_meta["fallback"]:
                     fallback_mgr = self.get_fallback_mgr()
@@ -797,25 +780,18 @@ class StagedBatchExecutor:
                         fallback_mgr.last_swapped_frame = result.copy()
                         fallback_mgr.num_frames_no_face = 0
                 if result is not None:
-                    write_image(render_path, result)
+                    writer.write_frame(result)
                 self.completed_units += 1
                 processed_frames += 1
-                self.update_progress("composite", detail="Compositing rendered frames", step_completed=processed_frames, step_total=frame_count, step_unit="frames")
+                self.update_progress("composite", detail="Streaming source decode + direct video encode", step_completed=processed_frames, step_total=frame_count, step_unit="frames")
         finally:
             compose_mgr.release_resources()
-        stages["composite"] = True
-        write_json(rendered_dir.parent / "manifest.json", manifest)
+            writer.close()
+        stages["composite"] = intermediate_video.exists()
+        write_json(intermediate_video.parent / "manifest.json", manifest)
 
 
-    def ensure_full_encode_stage(self, entry, index, rendered_dir, intermediate_video, frame_count, fps, endframe, stages, manifest):
-        if stages["encode"] and intermediate_video.exists():
-            self.update_progress("encode", detail="Reusing encoded intermediate video", step_completed=frame_count, step_total=frame_count, step_unit="frames", force_log=True)
-        else:
-            self.update_progress("encode", detail="Encoding final video with ffmpeg", step_completed=frame_count, step_total=frame_count, step_unit="frames", force_log=True)
-            ffmpeg.create_video(entry.filename, str(intermediate_video), fps, str(rendered_dir))
-            stages["encode"] = True
-            write_json(rendered_dir.parent / "manifest.json", manifest)
-
+    def ensure_full_encode_stage(self, entry, index, intermediate_video, frame_count, endframe):
         destination = util.replace_template(entry.finalname, index=index)
         Path(os.path.dirname(destination)).mkdir(parents=True, exist_ok=True)
         if util.has_extension(entry.filename, ['gif']):
