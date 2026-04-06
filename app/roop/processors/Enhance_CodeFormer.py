@@ -18,6 +18,7 @@ class Enhance_CodeFormer():
 
     processorname = 'codeformer'
     type = 'enhance'
+    supports_batch = True
     
 
     def Initialize(self, plugin_options:dict):
@@ -65,6 +66,32 @@ class Enhance_CodeFormer():
         result = (result * 255.0).round()
         scale_factor = int(result.shape[1] / input_size)       
         return result.astype(np.uint8), scale_factor
+
+
+    def RunBatch(self, source_facesets, target_faces, temp_frames, batch_size=1):
+        outputs = []
+        for batch_start in range(0, len(temp_frames), max(1, batch_size)):
+            batch = []
+            for temp_frame in temp_frames[batch_start:batch_start + max(1, batch_size)]:
+                temp_frame = cv2.resize(temp_frame, (512, 512), cv2.INTER_CUBIC)
+                temp_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
+                temp_frame = temp_frame.astype('float32') / 255.0
+                temp_frame = (temp_frame - 0.5) / 0.5
+                batch.append(temp_frame.transpose(2, 0, 1))
+            batch_input = np.stack(batch, axis=0).astype(np.float32)
+            weight = np.full((len(batch),), 0.5, dtype=np.float32)
+            batch_outputs = self.model_codeformer.run(None, {
+                self.model_inputs[0].name: batch_input,
+                self.model_inputs[1].name: weight
+            })[0]
+            for result in batch_outputs:
+                result = result.transpose((1, 2, 0))
+                result = np.clip(result, -1.0, 1.0)
+                result = (result + 1.0) / 2.0
+                result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+                result = (result * 255.0).round()
+                outputs.append(result.astype(np.uint8))
+        return outputs
 
 
     def Release(self):

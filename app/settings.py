@@ -31,7 +31,11 @@ class Settings:
         self.video_quality = self.default_get(data, 'video_quality', 14)
         self.clear_output = self.default_get(data, 'clear_output', True)
         self.max_threads = self.default_get(data, 'max_threads', 2)
-        self.memory_limit = self.default_get(data, 'memory_limit', 0)
+        legacy_memory_limit = self.default_get(data, 'memory_limit', 0)
+        self.memory_mode = self.default_get(data, 'memory_mode', 'smart')
+        self.max_ram_gb = self.default_get(data, 'max_ram_gb', legacy_memory_limit)
+        self.max_vram_gb = self.default_get(data, 'max_vram_gb', 0)
+        self.memory_limit = self.max_ram_gb
         self.provider = self.default_get(data, 'provider', 'cuda')
         self.force_cpu = self.default_get(data, 'force_cpu', False)
         self.output_template = self.default_get(data, 'output_template', '{file}_{time}')
@@ -45,7 +49,12 @@ class Settings:
         self.selected_enhancer = self.default_get(data, 'selected_enhancer', 'GPEN')
         self.subsample_upscale = self.default_get(data, 'subsample_upscale', '256px')
         self.blend_ratio = self.default_get(data, 'blend_ratio', 0.80)
-        self.video_swapping_method = self.default_get(data, 'video_swapping_method', 'In-Memory processing')
+        legacy_video_swapping_method = self.default_get(data, 'video_swapping_method', 'Smart staged processing')
+        if legacy_video_swapping_method == 'In-Memory processing':
+            legacy_video_swapping_method = 'Smart staged processing'
+        elif legacy_video_swapping_method == 'Extract Frames to media':
+            legacy_video_swapping_method = 'Legacy extract frames'
+        self.video_swapping_method = legacy_video_swapping_method
         self.no_face_action = self.default_get(data, 'no_face_action', 'Retry rotated')
         self.vr_mode = self.default_get(data, 'vr_mode', False)
         self.autorotate_faces = self.default_get(data, 'autorotate_faces', True)
@@ -84,7 +93,10 @@ class Settings:
             'video_quality' : self.video_quality,
             'clear_output' : self.clear_output,
             'max_threads' : self.max_threads,
-            'memory_limit' : self.memory_limit,
+            'memory_mode': self.memory_mode,
+            'max_ram_gb': self.max_ram_gb,
+            'max_vram_gb': self.max_vram_gb,
+            'memory_limit' : self.max_ram_gb,
             'provider' : self.provider,
             'force_cpu' : self.force_cpu,
             'output_template' : self.output_template,

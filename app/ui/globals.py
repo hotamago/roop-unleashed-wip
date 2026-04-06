@@ -9,7 +9,9 @@ ui_upscale = None
 ui_blend_ratio = None
 ui_input_thumbs = []
 ui_target_thumbs = []
+ui_target_files = []
 ui_camera_frame = None
+ui_memory_status = None
 
 # Saveable faceswap session component refs
 ui_selected_face_detection = None

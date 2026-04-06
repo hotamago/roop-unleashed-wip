@@ -5,7 +5,7 @@ import psutil
 
 from roop.ProcessOptions import ProcessOptions
 
-from roop.face_util import get_first_face, get_all_faces, rotate_anticlockwise, rotate_clockwise, clamp_cut_values
+from roop.face_util import align_crop, get_first_face, get_all_faces, rotate_anticlockwise, rotate_clockwise, clamp_cut_values
 from roop.utilities import compute_cosine_distance, get_device, str_to_class
 import roop.vr_util as vr
 
@@ -147,6 +147,231 @@ class ProcessMgr():
         for p in self.processors:
             if p.type.startswith("frame_"):
                 self.options.frame_processing = True
+
+
+    def serialize_face(self, face: Face):
+        data = {}
+        for key in ("bbox", "kps", "landmark_2d_106"):
+            value = getattr(face, key, None)
+            if value is None:
+                try:
+                    value = face[key]
+                except Exception:
+                    value = None
+            if value is None:
+                continue
+            if isinstance(value, np.ndarray):
+                data[key] = value.tolist()
+            else:
+                data[key] = value
+        matrix = getattr(face, "matrix", None)
+        if matrix is not None:
+            data["matrix"] = matrix.tolist() if isinstance(matrix, np.ndarray) else matrix
+        if hasattr(face, "sex"):
+            data["sex"] = face.sex
+        return data
+
+
+    def deserialize_face(self, data):
+        class FaceProxy(dict):
+            def __getattr__(self, name):
+                try:
+                    return self[name]
+                except KeyError as exc:
+                    raise AttributeError(name) from exc
+
+            def __setattr__(self, name, value):
+                self[name] = value
+
+        face = FaceProxy()
+        for key in ("bbox", "kps", "landmark_2d_106", "embedding", "matrix"):
+            value = data.get(key)
+            if value is None:
+                continue
+            face[key] = np.array(value, dtype=np.float32)
+        if "sex" in data:
+            face["sex"] = data["sex"]
+        return face
+
+    def _get_selected_input_index(self):
+        if not self.input_face_datas:
+            return None
+        selected_index = self.options.selected_index
+        if selected_index < 0:
+            return 0
+        max_index = len(self.input_face_datas) - 1
+        return max(0, min(selected_index, max_index))
+
+
+    def get_frame_face_targets(self, frame: Frame):
+        tasks = []
+        selected_input_index = self._get_selected_input_index()
+        if self.options.swap_mode == "first":
+            face = get_first_face(frame)
+            if face is None:
+                return tasks
+            if selected_input_index is None:
+                return tasks
+            tasks.append((selected_input_index, face))
+            return tasks
+
+        faces = get_all_faces(frame)
+        if faces is None:
+            return tasks
+
+        if self.options.swap_mode == "all":
+            for face in faces:
+                if selected_input_index is None:
+                    break
+                tasks.append((selected_input_index, face))
+        elif self.options.swap_mode == "all_input":
+            for i, face in enumerate(faces):
+                if i >= len(self.input_face_datas):
+                    break
+                tasks.append((i, face))
+        elif self.options.swap_mode == "selected":
+            num_targetfaces = len(self.target_face_datas)
+            use_index = num_targetfaces == 1
+            if use_index and selected_input_index is None:
+                return tasks
+            for i, tf in enumerate(self.target_face_datas):
+                for face in faces:
+                    if compute_cosine_distance(tf.embedding, face.embedding) <= self.options.face_distance_threshold:
+                        if i < len(self.input_face_datas):
+                            input_index = selected_input_index if use_index else i
+                            tasks.append((input_index, face))
+                        if not roop.globals.vr_mode and len(tasks) == num_targetfaces:
+                            break
+        elif self.options.swap_mode == "all_female" or self.options.swap_mode == "all_male":
+            gender = 'F' if self.options.swap_mode == "all_female" else 'M'
+            for face in faces:
+                if face.sex == gender:
+                    if selected_input_index is None:
+                        break
+                    tasks.append((selected_input_index, face))
+
+        if roop.globals.vr_mode and len(tasks) % 2 > 0:
+            return []
+        return tasks
+
+
+    def prepare_face_task(self, face_index, target_face: Face, frame: Frame):
+        inputface = self.input_face_datas[face_index].faces[0] if len(self.input_face_datas) > face_index else None
+        working_frame = frame
+        working_face = target_face
+        rotation_action = None
+        cutout_box = None
+        if roop.globals.autorotate_faces:
+            rotation_action = self.rotation_action(target_face, frame)
+            if rotation_action is not None:
+                (start_x, start_y, end_x, end_y) = target_face["bbox"].astype("int")
+                width = end_x - start_x
+                height = end_y - start_y
+                offs = int(max(width, height) * 0.25)
+                rotcutframe, start_x, start_y, end_x, end_y = self.cutout(frame, start_x - offs, start_y - offs, end_x + offs, end_y + offs)
+                if rotation_action == "rotate_anticlockwise":
+                    rotcutframe = rotate_anticlockwise(rotcutframe)
+                elif rotation_action == "rotate_clockwise":
+                    rotcutframe = rotate_clockwise(rotcutframe)
+                rotface = get_first_face(rotcutframe)
+                if rotface is None:
+                    rotation_action = None
+                else:
+                    working_frame = rotcutframe
+                    working_face = rotface
+                    cutout_box = [start_x, start_y, end_x, end_y]
+
+        aligned_img, matrix = align_crop(working_frame, working_face.kps, self.options.subsample_size)
+        working_face.matrix = matrix
+        mask_offsets = [0, 0, 0, 0, 20.0, 10.0, 1.0, 1.0, 1.0, 1.0]
+        if inputface is not None and hasattr(inputface, "mask_offsets"):
+            mask_offsets = list(inputface.mask_offsets)
+        while len(mask_offsets) < 10:
+            mask_offsets.append(1.0)
+        return {
+            "input_index": face_index,
+            "aligned_frame": aligned_img,
+            "target_face": self.serialize_face(working_face),
+            "rotation_action": rotation_action,
+            "cutout_box": cutout_box,
+            "mask_offsets": mask_offsets,
+        }
+
+
+    def build_frame_plan(self, frame: Frame):
+        selected_faces = self.get_frame_face_targets(frame)
+        tasks = [self.prepare_face_task(face_index, face, frame) for face_index, face in selected_faces]
+        fallback_required = len(tasks) == 0
+        if roop.globals.no_face_action == eNoFaceAction.SKIP_FRAME_IF_DISSIMILAR and 0 < len(tasks) < len(self.input_face_datas):
+            fallback_required = True
+            tasks = []
+        return {"tasks": tasks, "fallback": fallback_required}
+
+
+    def run_swap_task(self, task, processor, batch_size: int = 1):
+        inputface = self.input_face_datas[task["input_index"]].faces[0] if len(self.input_face_datas) > task["input_index"] else None
+        target_face = self.deserialize_face(task["target_face"])
+        model_output_size = 128
+        subsample_total = self.options.subsample_size // model_output_size
+        current_frames = list(self.implode_pixel_boost(task["aligned_frame"], model_output_size, subsample_total))
+        for _ in range(0, self.options.num_swap_steps):
+            prepared_frames = [self.prepare_crop_frame(frame) for frame in current_frames]
+            if getattr(processor, "supports_batch", False):
+                raw_outputs = processor.RunBatch([inputface] * len(prepared_frames), [target_face] * len(prepared_frames), prepared_frames, max(1, batch_size))
+                current_frames = [self.normalize_swap_frame(output) for output in raw_outputs]
+            else:
+                next_frames = []
+                for prepared_frame in prepared_frames:
+                    output = processor.Run(inputface, target_face, prepared_frame)
+                    next_frames.append(self.normalize_swap_frame(output))
+                current_frames = next_frames
+        fake_frame = self.explode_pixel_boost(current_frames, model_output_size, subsample_total, self.options.subsample_size)
+        return fake_frame.astype(np.uint8)
+
+
+    def run_mask_task(self, task, current_frame, processor):
+        return self.process_mask(processor, task["aligned_frame"], current_frame)
+
+
+    def run_enhance_task(self, task, current_frame, processor):
+        target_face = self.deserialize_face(task["target_face"])
+        input_faceset = self.input_face_datas[task["input_index"]] if len(self.input_face_datas) > task["input_index"] else None
+        return processor.Run(input_faceset, target_face, current_frame)
+
+
+    def compose_task(self, base_frame, task, fake_frame, enhanced_frame=None):
+        target_face = self.deserialize_face(task["target_face"])
+        target_img = base_frame
+        rotation_action = task.get("rotation_action")
+        cutout_box = task.get("cutout_box")
+        if rotation_action is not None and cutout_box is not None:
+            cutout_frame, _, _, _, _ = self.cutout(base_frame, cutout_box[0], cutout_box[1], cutout_box[2], cutout_box[3])
+            if rotation_action == "rotate_anticlockwise":
+                target_img = rotate_anticlockwise(cutout_frame)
+            elif rotation_action == "rotate_clockwise":
+                target_img = rotate_clockwise(cutout_frame)
+            else:
+                target_img = cutout_frame
+
+        upscale = 512
+        orig_width = fake_frame.shape[1]
+        if orig_width != upscale:
+            fake_frame = cv2.resize(fake_frame, (upscale, upscale), cv2.INTER_CUBIC)
+        scale_factor = int(upscale / max(orig_width, 1))
+        face_lm = target_face.landmark_2d_106 if hasattr(target_face, 'landmark_2d_106') and target_face.landmark_2d_106 is not None else None
+        if enhanced_frame is None:
+            result = self.paste_upscale(fake_frame, fake_frame, target_face.matrix, target_img, scale_factor, task["mask_offsets"], face_landmarks=face_lm)
+        else:
+            result = self.paste_upscale(fake_frame, enhanced_frame, target_face.matrix, target_img, scale_factor, task["mask_offsets"], face_landmarks=face_lm)
+
+        if self.options.restore_original_mouth:
+            mouth_cutout, mouth_bb, mouth_polygon = self.create_mouth_mask(target_face, target_img, task["mask_offsets"])
+            result = self.apply_mouth_area(result, mouth_cutout, mouth_bb, mouth_polygon, task["mask_offsets"][5])
+
+        if rotation_action is not None and cutout_box is not None:
+            unrotated = self.auto_unrotate_frame(result, rotation_action)
+            return self.paste_simple(unrotated, base_frame, cutout_box[0], cutout_box[1])
+        return result
 
 
     def run_batch(self, source_files, target_files, threads:int = 1):
@@ -471,8 +696,6 @@ class ProcessMgr():
 
 
     def process_face(self, face_index, target_face:Face, frame:Frame):
-        from roop.face_util import align_crop
-
         enhanced_frame = None
         if len(self.input_face_datas) > 0:
             inputface = self.input_face_datas[face_index].faces[0]

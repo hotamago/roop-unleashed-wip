@@ -23,6 +23,7 @@ face_position = None
 video_encoder = None
 video_quality = None
 max_memory = None
+max_vram = None
 execution_providers: List[str] = ['CUDAExecutionProvider', 'CPUExecutionProvider']
 execution_threads = None
 headless = None
@@ -37,6 +38,8 @@ default_det_size = True
 no_face_action = 1
 
 processing = False
+runtime_memory_status = 'Memory budget: not computed yet'
+active_memory_plan = None
 
 g_current_face_analysis = None
 g_desired_face_analysis = None

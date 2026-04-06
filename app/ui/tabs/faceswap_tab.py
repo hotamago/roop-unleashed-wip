@@ -33,6 +33,76 @@ current_video_fps = 50
 manual_masking = False
 
 
+def extract_target_path(item):
+    if item is None:
+        return None
+    if isinstance(item, str):
+        return item
+    if hasattr(item, "name"):
+        return item.name
+    return str(item)
+
+
+def normalize_target_path(raw_path: str):
+    if raw_path is None:
+        return None
+    clean_path = raw_path.strip().strip('"').strip("'")
+    if len(clean_path) < 1:
+        return None
+    if not os.path.isabs(clean_path):
+        clean_path = os.path.abspath(os.path.join(os.getcwd(), clean_path))
+    clean_path = os.path.normpath(clean_path)
+    if not os.path.exists(clean_path):
+        gr.Warning(f"Target path not found: {clean_path}")
+        return None
+    if os.path.isdir(clean_path):
+        gr.Warning(f"Directories are not supported yet: {clean_path}")
+        return None
+    if not (util.is_image(clean_path) or util.is_video(clean_path) or clean_path.lower().endswith('gif')):
+        gr.Warning(f"Unsupported target file: {clean_path}")
+        return None
+    return clean_path
+
+
+def list_target_paths(files):
+    if files is None:
+        return []
+    paths = []
+    seen = set()
+    for item in files:
+        path = extract_target_path(item)
+        norm_path = normalize_target_path(path)
+        if norm_path is None or norm_path in seen:
+            continue
+        seen.add(norm_path)
+        paths.append(norm_path)
+    return paths
+
+
+def merge_target_paths(existing_files, new_lines: str):
+    merged = list_target_paths(existing_files)
+    seen = set(merged)
+    for line in (new_lines or "").splitlines():
+        norm_path = normalize_target_path(line)
+        if norm_path is None or norm_path in seen:
+            continue
+        seen.add(norm_path)
+        merged.append(norm_path)
+    ui.globals.ui_target_files = list(merged)
+    return merged
+
+
+def rebuild_process_entries(destfiles):
+    global list_files_process
+
+    list_files_process.clear()
+    paths = list_target_paths(destfiles)
+    ui.globals.ui_target_files = list(paths)
+    for path in paths:
+        list_files_process.append(ProcessEntry(path, 0, 0, 0))
+    return paths
+
+
 def faceswap_tab():
     global no_face_choices, previewimage
 
@@ -40,6 +110,13 @@ def faceswap_tab():
         with gr.Row(variant='panel'):
             bt_srcfiles = gr.Files(label='Source Images or Facesets', file_count="multiple", file_types=["image", ".fsz"], elem_id='filelist', height=233)
             bt_destfiles = gr.Files(label='Target File(s)', file_count="multiple", file_types=["image", "video"], elem_id='filelist', height=233)
+        with gr.Row(variant='panel'):
+            target_path_input = gr.Textbox(
+                label="Target File(s) Path",
+                lines=4,
+                placeholder="One file path per line. Relative paths resolve from ./app",
+            )
+            bt_add_target_paths = gr.Button("Add Target Paths", variant='secondary')
         with gr.Row(variant='panel'):
             with gr.Column(scale=2):
                 with gr.Row():
@@ -157,7 +234,7 @@ def faceswap_tab():
 
         with gr.Row(variant='panel'):
             with gr.Column(scale=1):
-                video_swapping_method = gr.Dropdown(["Extract Frames to media","In-Memory processing"], value=roop.globals.CFG.video_swapping_method, label="Select video processing method", interactive=True)
+                video_swapping_method = gr.Dropdown(["Smart staged processing", "Legacy extract frames"], value=roop.globals.CFG.video_swapping_method, label="Select video processing method", interactive=True)
                 no_face_action = gr.Dropdown(choices=no_face_choices, value=roop.globals.CFG.no_face_action, label="Action on no face detected", interactive=True)
                 vr_mode = gr.Checkbox(label="VR Mode", value=roop.globals.CFG.vr_mode)
             with gr.Column(scale=1):
@@ -235,7 +312,13 @@ def faceswap_tab():
 
     bt_destfiles.change(fn=on_destfiles_changed, inputs=[bt_destfiles], outputs=[preview_frame_num, text_frame_clip], show_progress='hidden').success(fn=on_preview_frame_changed, inputs=previewinputs, outputs=previewoutputs, show_progress='hidden')
     bt_destfiles.select(fn=on_destfiles_selected, outputs=[preview_frame_num, text_frame_clip], show_progress='hidden').success(fn=on_preview_frame_changed, inputs=previewinputs, outputs=previewoutputs, show_progress='hidden')
-    bt_destfiles.clear(fn=on_clear_destfiles, outputs=[target_faces])
+    bt_add_target_paths.click(
+        fn=on_add_target_paths,
+        inputs=[target_path_input, bt_destfiles],
+        outputs=[bt_destfiles, target_path_input, preview_frame_num, text_frame_clip],
+        show_progress='hidden'
+    ).success(fn=on_preview_frame_changed, inputs=previewinputs, outputs=previewoutputs, show_progress='hidden')
+    bt_destfiles.clear(fn=on_clear_destfiles, outputs=[target_faces, preview_frame_num, text_frame_clip, target_path_input])
     bt_clear_input_faces.click(fn=on_clear_input_faces, outputs=[input_faces])
 
     bt_preview_mask.click(fn=on_preview_mask, inputs=[preview_frame_num, bt_destfiles, clip_text, selected_mask_engine], outputs=[previewimage]) 
@@ -303,6 +386,12 @@ def on_mask_engine_changed(mask_engine):
     if mask_engine == "Clip2Seg":
         return gr.Textbox(interactive=True)
     return gr.Textbox(interactive=False)
+
+
+def on_add_target_paths(path_text, current_files):
+    merged = merge_target_paths(current_files, path_text)
+    slider, frame_text = on_destfiles_changed(merged)
+    return merged, "", slider, frame_text
 
 
 
@@ -443,7 +532,10 @@ def remove_selected_target_face():
 
 
 def on_use_face_from_selected(files, frame_num):
-    roop.globals.target_path = files[selected_preview_index].name
+    target_paths = list_target_paths(files)
+    if selected_preview_index >= len(target_paths):
+        return ui.globals.ui_target_thumbs, gr.Dropdown(visible=True)
+    roop.globals.target_path = target_paths[selected_preview_index]
     faces_data = []
 
     if util.is_image(roop.globals.target_path) and not roop.globals.target_path.lower().endswith(('gif')):
@@ -483,10 +575,11 @@ def on_preview_frame_changed(frame_num, files, fake_preview, enhancer, detection
             mask_offsets.append(1.0)
 
     timeinfo = '0:00:00'
-    if files is None or selected_preview_index >= len(files) or frame_num is None:
+    target_paths = list_target_paths(files)
+    if len(target_paths) < 1 or selected_preview_index >= len(target_paths) or frame_num is None:
         return None,None, gr.Slider(info=timeinfo)
 
-    filename = files[selected_preview_index].name
+    filename = target_paths[selected_preview_index]
     if util.is_video(filename) or filename.lower().endswith('gif'):
         current_frame = get_video_frame(filename, frame_num)
         if current_video_fps == 0:
@@ -565,6 +658,8 @@ def gen_processing_text(start, end):
 def on_set_frame(sender:str, frame_num):
     global selected_preview_index, list_files_process
     
+    if len(list_files_process) < 1:
+        return gen_processing_text(0, 0)
     idx = selected_preview_index
     if list_files_process[idx].endframe == 0:
         return gen_processing_text(0,0)
@@ -583,10 +678,11 @@ def on_preview_mask(frame_num, files, clip_text, mask_engine):
     from roop.core import live_swap, get_processing_plugins
     global is_processing
 
-    if is_processing or files is None or selected_preview_index >= len(files) or clip_text is None or frame_num is None:
+    target_paths = list_target_paths(files)
+    if is_processing or len(target_paths) < 1 or selected_preview_index >= len(target_paths) or clip_text is None or frame_num is None:
         return None
         
-    filename = files[selected_preview_index].name
+    filename = target_paths[selected_preview_index]
     if util.is_video(filename) or filename.lower().endswith('gif'):
         current_frame = get_video_frame(filename, frame_num
                                         )
@@ -613,9 +709,13 @@ def on_clear_input_faces():
     return ui.globals.ui_input_thumbs
 
 def on_clear_destfiles():
+    global selected_preview_index
     roop.globals.TARGET_FACES.clear()
     ui.globals.ui_target_thumbs.clear()
-    return ui.globals.ui_target_thumbs
+    ui.globals.ui_target_files = []
+    list_files_process.clear()
+    selected_preview_index = 0
+    return ui.globals.ui_target_thumbs, gr.Slider(value=1, maximum=1, info='0:00:00'), '', ''
 
 
 def index_of_no_face_action(dropdown_text):
@@ -642,13 +742,14 @@ def start_swap( output_method, enhancer, detection, keep_frames, wait_after_extr
                 selected_mask_engine, clip_text, processing_method, no_face_action, vr_mode, autorotate, restore_original_mouth, num_swap_steps, upsample, imagemask, progress=gr.Progress()):
     from ui.main import prepare_environment
     from roop.core import batch_process_regular
+    from roop.memory import describe_memory_plan, resolve_memory_plan
     global is_processing, list_files_process
 
     if list_files_process is None or len(list_files_process) <= 0:
         return gr.Button(variant="primary"), None
     
     if roop.globals.CFG.clear_output:
-        shutil.rmtree(roop.globals.output_path)
+        shutil.rmtree(roop.globals.output_path, ignore_errors=True)
 
     if not util.is_installed("ffmpeg"):
         msg = "ffmpeg is not installed! No video processing possible."
@@ -680,9 +781,11 @@ def start_swap( output_method, enhancer, detection, keep_frames, wait_after_extr
     roop.globals.execution_threads = roop.globals.CFG.max_threads
     roop.globals.video_encoder = roop.globals.CFG.output_video_codec
     roop.globals.video_quality = roop.globals.CFG.video_quality
-    roop.globals.max_memory = roop.globals.CFG.memory_limit if roop.globals.CFG.memory_limit > 0 else None
+    roop.globals.max_memory = roop.globals.CFG.max_ram_gb if roop.globals.CFG.max_ram_gb > 0 else None
+    roop.globals.max_vram = roop.globals.CFG.max_vram_gb if roop.globals.CFG.max_vram_gb > 0 else None
+    gr.Info(describe_memory_plan(resolve_memory_plan()))
 
-    batch_process_regular(output_method, list_files_process, mask_engine, clip_text, processing_method == "In-Memory processing", imagemask, restore_original_mouth, num_swap_steps, progress, SELECTED_INPUT_FACE_INDEX)
+    batch_process_regular(output_method, list_files_process, mask_engine, clip_text, processing_method, imagemask, restore_original_mouth, num_swap_steps, progress, SELECTED_INPUT_FACE_INDEX)
     is_processing = False
     yield gr.Button(variant="primary", interactive=True), gr.Button(variant="secondary", interactive=False)
 
@@ -696,12 +799,9 @@ def stop_swap():
 def on_destfiles_changed(destfiles):
     global selected_preview_index, list_files_process, current_video_fps
 
-    list_files_process.clear()
-    if destfiles is None or len(destfiles) < 1:
+    target_paths = rebuild_process_entries(destfiles)
+    if len(target_paths) < 1:
         return gr.Slider(value=1, maximum=1, info='0:00:00'), ''
-
-    for f in destfiles:
-        list_files_process.append(ProcessEntry(f.name, 0,0, 0))
 
     selected_preview_index = 0
     idx = selected_preview_index    
@@ -726,8 +826,11 @@ def on_destfiles_changed(destfiles):
 def on_destfiles_selected(evt: gr.SelectData):
     global selected_preview_index, list_files_process, current_video_fps
 
+    if len(list_files_process) < 1:
+        return gr.Slider(value=1, maximum=1, info='0:00:00'), gen_processing_text(0, 0)
     if evt is not None:
         selected_preview_index = evt.index
+    selected_preview_index = min(selected_preview_index, len(list_files_process) - 1)
     idx = selected_preview_index
     filename = list_files_process[idx].filename
     if util.is_video(filename) or filename.lower().endswith('gif'):

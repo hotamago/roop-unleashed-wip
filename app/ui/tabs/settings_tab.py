@@ -4,6 +4,7 @@ import gradio as gr
 import roop.globals
 import ui.globals
 import json
+from roop.memory import describe_memory_plan, resolve_memory_plan
 
 image_formats = ['jpg','png', 'webp']
 video_formats = ['avi','mkv', 'mp4', 'webm']
@@ -17,7 +18,9 @@ def settings_tab():
     from roop.core import suggest_execution_providers
     global providerlist
 
+    settings_controls.clear()
     providerlist = suggest_execution_providers()
+    initial_memory_status = describe_memory_plan(resolve_memory_plan())
     with gr.Tab("⚙ Settings"):
         with gr.Row():
             with gr.Column():
@@ -37,11 +40,13 @@ def settings_tab():
         with gr.Row():
             with gr.Column():
                 settings_controls.append(gr.Dropdown(providerlist, label="Provider", value=roop.globals.CFG.provider, elem_id='provider', interactive=True))
+                settings_controls.append(gr.Dropdown(["smart", "manual"], label="Memory Mode", value=roop.globals.CFG.memory_mode, elem_id='memory_mode', interactive=True))
                 chk_det_size = gr.Checkbox(label="Use default Det-Size", value=True, elem_id='default_det_size', interactive=True)
                 settings_controls.append(gr.Checkbox(label="Force CPU for Face Analyser", value=roop.globals.CFG.force_cpu, elem_id='force_cpu', interactive=True))
                 max_threads = gr.Slider(1, 32, value=roop.globals.CFG.max_threads, label="Max. Number of Threads", info='default: 3', step=1.0, interactive=True)
             with gr.Column():
-                memory_limit = gr.Slider(0, 128, value=roop.globals.CFG.memory_limit, label="Max. Memory to use (Gb)", info='0 meaning no limit', step=1.0, interactive=True)
+                max_ram_gb = gr.Slider(0, 128, value=roop.globals.CFG.max_ram_gb, label="Max. RAM to use (Gb)", info='0 meaning auto/unset', step=1.0, interactive=True)
+                max_vram_gb = gr.Slider(0, 64, value=roop.globals.CFG.max_vram_gb, label="Max. VRAM to use (Gb)", info='0 meaning auto/unset', step=0.5, interactive=True)
                 settings_controls.append(gr.Dropdown(image_formats, label="Image Output Format", info='default: png', value=roop.globals.CFG.output_image_format, elem_id='output_image_format', interactive=True))
             with gr.Column():
                 settings_controls.append(gr.Dropdown(video_codecs, label="Video Codec", info='default: libx264', value=roop.globals.CFG.output_video_codec, elem_id='output_video_codec', interactive=True))
@@ -51,21 +56,26 @@ def settings_tab():
                 with gr.Group():
                     settings_controls.append(gr.Checkbox(label='Use OS temp folder', value=roop.globals.CFG.use_os_temp_folder, elem_id='use_os_temp_folder', interactive=True))
                     settings_controls.append(gr.Checkbox(label='Show video in browser (re-encodes output)', value=roop.globals.CFG.output_show_video, elem_id='output_show_video', interactive=True))
+                    memory_status = gr.Markdown(initial_memory_status)
                 button_apply_restart = gr.Button("Restart Server", variant='primary')
                 button_clean_temp = gr.Button("Clean temp folder")
+                button_clean_cache = gr.Button("Clean Processing Cache")
                 button_apply_settings = gr.Button("Apply Settings")
+                ui.globals.ui_memory_status = memory_status
 
     chk_det_size.select(fn=on_option_changed)
 
     # Settings
     for s in settings_controls:
-        s.select(fn=on_settings_changed)
-    max_threads.input(fn=lambda a,b='max_threads':on_settings_changed_misc(a,b), inputs=[max_threads])
-    memory_limit.input(fn=lambda a,b='memory_limit':on_settings_changed_misc(a,b), inputs=[memory_limit])
-    video_quality.input(fn=lambda a,b='video_quality':on_settings_changed_misc(a,b), inputs=[video_quality])
+        s.select(fn=on_settings_changed, outputs=[memory_status])
+    max_threads.input(fn=lambda a,b='max_threads':on_settings_changed_misc(a,b), inputs=[max_threads], outputs=[memory_status])
+    max_ram_gb.input(fn=lambda a,b='max_ram_gb':on_settings_changed_misc(a,b), inputs=[max_ram_gb], outputs=[memory_status])
+    max_vram_gb.input(fn=lambda a,b='max_vram_gb':on_settings_changed_misc(a,b), inputs=[max_vram_gb], outputs=[memory_status])
+    video_quality.input(fn=lambda a,b='video_quality':on_settings_changed_misc(a,b), inputs=[video_quality], outputs=[memory_status])
 
     button_clean_temp.click(fn=clean_temp)
-    button_apply_settings.click(apply_settings, inputs=[input_server_name, input_server_port, output_template])
+    button_clean_cache.click(fn=clean_processing_cache)
+    button_apply_settings.click(apply_settings, inputs=[input_server_name, input_server_port, output_template], outputs=[memory_status])
     button_apply_restart.click(restart)
 
 
@@ -113,9 +123,11 @@ def on_option_changed(evt: gr.SelectData):
 def on_settings_changed_misc(new_val, attribname):
     if hasattr(roop.globals.CFG, attribname):
         setattr(roop.globals.CFG, attribname, new_val)
+        if attribname == 'max_ram_gb':
+            roop.globals.CFG.memory_limit = new_val
     else:
         print("Didn't find attrib!")
-        
+    return update_memory_status()
 
 
 def on_settings_changed(evt: gr.SelectData):
@@ -123,11 +135,11 @@ def on_settings_changed(evt: gr.SelectData):
     if isinstance(evt.target, gr.Checkbox):
         if hasattr(roop.globals.CFG, attribname):
             setattr(roop.globals.CFG, attribname, evt.selected)
-            return
+            return update_memory_status()
     elif isinstance(evt.target, gr.Dropdown):
         if hasattr(roop.globals.CFG, attribname):
             setattr(roop.globals.CFG, attribname, evt.value)
-            return
+            return update_memory_status()
             
     raise gr.Error(f'Unhandled Setting for {evt.target}')
 
@@ -151,9 +163,24 @@ def apply_settings(input_server_name, input_server_port, output_template):
     roop.globals.CFG.server_name = input_server_name
     roop.globals.CFG.server_port = input_server_port
     roop.globals.CFG.output_template = output_template
+    roop.globals.CFG.memory_limit = roop.globals.CFG.max_ram_gb
     roop.globals.CFG.save()
     show_msg('Settings saved')
+    return update_memory_status()
 
 
 def restart():
     ui.globals.ui_restart_server = True
+
+
+def update_memory_status():
+    plan = resolve_memory_plan()
+    return gr.Markdown(value=describe_memory_plan(plan))
+
+
+def clean_processing_cache():
+    jobs_dir = os.path.join(os.environ.get("TEMP", os.getcwd()), "jobs")
+    if os.path.isdir(jobs_dir):
+        shutil.rmtree(jobs_dir)
+    os.makedirs(jobs_dir, exist_ok=True)
+    gr.Info('Processing cache removed')

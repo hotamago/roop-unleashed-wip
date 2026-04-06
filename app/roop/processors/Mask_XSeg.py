@@ -17,6 +17,7 @@ class Mask_XSeg():
 
     processorname = 'mask_xseg'
     type = 'mask'
+    supports_batch = True
 
 
     def Initialize(self, plugin_options:dict):
@@ -51,6 +52,24 @@ class Mask_XSeg():
         # invert values to mask areas to keep
         result = 1.0 - result
         return result       
+
+
+    def RunBatch(self, images, keywords:str, batch_size=1):
+        outputs = []
+        for batch_start in range(0, len(images), max(1, batch_size)):
+            batch = []
+            for img in images[batch_start:batch_start + max(1, batch_size)]:
+                temp_frame = cv2.resize(img, (256, 256), cv2.INTER_CUBIC)
+                temp_frame = temp_frame.astype('float32') / 255.0
+                batch.append(temp_frame)
+            batch_input = np.stack(batch, axis=0).astype(np.float32)
+            batch_outputs = self.model_xseg.run(None, {self.model_inputs[0].name: batch_input})[0]
+            for result in batch_outputs:
+                result = result[0]
+                result = np.clip(result, 0, 1.0)
+                result[result < 0.1] = 0
+                outputs.append(1.0 - result)
+        return outputs
 
 
     def Release(self):

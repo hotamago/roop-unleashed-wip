@@ -33,11 +33,12 @@ def cut_video(original_video: str, cut_video: str, start_frame: int, end_frame: 
 def join_videos(videos: List[str], dest_filename: str, simple: bool):
     if simple:
         txtfilename = util.resolve_relative_path('../temp')
+        os.makedirs(txtfilename, exist_ok=True)
         txtfilename = os.path.join(txtfilename, 'joinvids.txt')
         with open(txtfilename, "w", encoding="utf-8") as f:
             for v in videos:
-                 v = v.replace('\\', '/')
-                 f.write(f"file {v}\n")
+                 v = v.replace('\\', '/').replace("'", "'\\''")
+                 f.write(f"file '{v}'\n")
         commands = ['-f', 'concat', '-safe', '0', '-i', f'{txtfilename}', '-vcodec', 'copy', f'{dest_filename}']
         run_ffmpeg(commands)
 
