@@ -56,13 +56,18 @@ def join_videos(videos: List[str], dest_filename: str, simple: bool):
 
 
 
-def extract_frames(target_path : str, trim_frame_start, trim_frame_end, fps : float) -> bool:
-    util.create_temp(target_path)
-    temp_directory_path = util.get_temp_directory_path(target_path)
+def extract_frames(target_path : str, trim_frame_start, trim_frame_end, fps : float, temp_directory_path: str = None, image_format: str = None) -> bool:
+    if temp_directory_path is None:
+        util.create_temp(target_path)
+        temp_directory_path = util.get_temp_directory_path(target_path)
+    else:
+        os.makedirs(temp_directory_path, exist_ok=True)
+    if image_format is None:
+        image_format = roop.globals.CFG.output_image_format
     commands = ['-i', target_path, '-q:v', '1', '-pix_fmt', 'rgb24', ]
     if trim_frame_start is not None and trim_frame_end is not None:
         commands.extend([ '-vf', 'trim=start_frame=' + str(trim_frame_start) + ':end_frame=' + str(trim_frame_end) + ',fps=' + str(fps) ])
-    commands.extend(['-vsync', '0', os.path.join(temp_directory_path, '%06d.' + roop.globals.CFG.output_image_format)])
+    commands.extend(['-vsync', '0', os.path.join(temp_directory_path, '%06d.' + image_format)])
     return run_ffmpeg(commands)
 
 

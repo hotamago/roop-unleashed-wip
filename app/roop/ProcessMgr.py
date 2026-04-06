@@ -337,6 +337,53 @@ class ProcessMgr():
         return fake_frame.astype(np.uint8)
 
 
+    def run_swap_tasks_batch(self, tasks, processor, batch_size: int = 1):
+        if not tasks:
+            return {}
+        model_output_size = 128
+        subsample_total = max(self.options.subsample_size // model_output_size, 1)
+        prepared_tasks = []
+        for task in tasks:
+            inputface = self.input_face_datas[task["input_index"]].faces[0] if len(self.input_face_datas) > task["input_index"] else None
+            target_face = self.deserialize_face(task["target_face"])
+            current_frames = list(self.implode_pixel_boost(task["aligned_frame"], model_output_size, subsample_total))
+            prepared_tasks.append({
+                "cache_key": task["cache_key"],
+                "input_face": inputface,
+                "target_face": target_face,
+                "current_frames": current_frames,
+            })
+
+        for _ in range(0, self.options.num_swap_steps):
+            prepared_frames = []
+            source_faces = []
+            target_faces = []
+            frame_map = []
+            for task_index, prepared_task in enumerate(prepared_tasks):
+                for slice_index, current_frame in enumerate(prepared_task["current_frames"]):
+                    prepared_frames.append(self.prepare_crop_frame(current_frame))
+                    source_faces.append(prepared_task["input_face"])
+                    target_faces.append(prepared_task["target_face"])
+                    frame_map.append((task_index, slice_index))
+
+            if getattr(processor, "supports_batch", False):
+                raw_outputs = processor.RunBatch(source_faces, target_faces, prepared_frames, max(1, batch_size))
+                normalized_outputs = [self.normalize_swap_frame(output) for output in raw_outputs]
+            else:
+                normalized_outputs = []
+                for source_face, target_face, prepared_frame in zip(source_faces, target_faces, prepared_frames):
+                    normalized_outputs.append(self.normalize_swap_frame(processor.Run(source_face, target_face, prepared_frame)))
+
+            for (task_index, slice_index), normalized_output in zip(frame_map, normalized_outputs):
+                prepared_tasks[task_index]["current_frames"][slice_index] = normalized_output
+
+        outputs = {}
+        for prepared_task in prepared_tasks:
+            fake_frame = self.explode_pixel_boost(prepared_task["current_frames"], model_output_size, subsample_total, self.options.subsample_size)
+            outputs[prepared_task["cache_key"]] = fake_frame.astype(np.uint8)
+        return outputs
+
+
     def run_mask_task(self, task, current_frame, processor):
         return self.process_mask(processor, task["aligned_frame"], current_frame)
 

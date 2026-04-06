@@ -66,15 +66,13 @@ def resolve_memory_plan(width: int = 0, height: int = 0) -> dict:
     chunk_size = int(ram_budget_bytes / approx_frame_cost)
     chunk_size = max(8, min(chunk_size, 240))
 
-    face_pixels = max(roop.globals.subsample_size, 128) ** 2
     swap_batch = 1
     mask_batch = 1
     enhance_batch = 1
     if vram_budget is not None and vram_budget > 0:
-        vram_budget_bytes = vram_budget * (1024 ** 3)
-        swap_batch = max(1, min(16, int(vram_budget_bytes / max(face_pixels * 6, 1))))
-        mask_batch = max(1, min(32, int(vram_budget_bytes / max(face_pixels * 3, 1))))
-        enhance_batch = max(1, min(8, int(vram_budget_bytes / max((512 * 512) * 10, 1))))
+        swap_batch = max(4, min(128, int(vram_budget * 8)))
+        mask_batch = max(8, min(256, int(vram_budget * 16)))
+        enhance_batch = max(2, min(32, int(vram_budget * 2.5)))
 
     prefetch_frames = max(4, min(chunk_size // 2, 48))
     plan = {

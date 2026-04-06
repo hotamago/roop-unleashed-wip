@@ -22,6 +22,7 @@ def _default_state():
         "step_total": None,
         "step_unit": None,
         "rate": None,
+        "rate_unit": None,
         "eta": None,
         "elapsed": 0.0,
         "detail": None,
@@ -113,7 +114,7 @@ def render_status_line(state):
 
     rate = state.get("rate")
     if _is_number(rate) and rate > 0:
-        parts.append(f"Speed: {rate:.2f} {state.get('unit', 'units')}/s")
+        parts.append(f"Speed: {rate:.2f} {state.get('rate_unit') or state.get('unit', 'units')}/s")
 
     eta = state.get("eta")
     if _is_number(eta) and eta >= 0:
@@ -168,7 +169,7 @@ def render_status_markdown(state):
 
     rate = state.get("rate")
     if _is_number(rate) and rate > 0:
-        lines.append(f"- Speed: {rate:.2f} {state.get('unit', 'units')}/s")
+        lines.append(f"- Speed: {rate:.2f} {state.get('rate_unit') or state.get('unit', 'units')}/s")
 
     eta = state.get("eta")
     if _is_number(eta) and eta >= 0:
@@ -267,7 +268,7 @@ def set_memory_status(memory_status):
     return _apply_state(state, force_log=False)
 
 
-def publish_processing_progress(stage=None, completed=None, total=None, unit=None, target_name=None, file_index=None, total_files=None, chunk_index=None, total_chunks=None, step_completed=None, step_total=None, step_unit=None, rate=None, elapsed=None, eta=None, detail=None, memory_status=None, force_log=False):
+def publish_processing_progress(stage=None, completed=None, total=None, unit=None, target_name=None, file_index=None, total_files=None, chunk_index=None, total_chunks=None, step_completed=None, step_total=None, step_unit=None, rate=None, rate_unit=None, elapsed=None, eta=None, detail=None, memory_status=None, force_log=False):
     state = _ensure_state()
     now = time.time()
 
@@ -299,6 +300,8 @@ def publish_processing_progress(stage=None, completed=None, total=None, unit=Non
         state["step_total"] = step_total
     if step_unit is not None:
         state["step_unit"] = step_unit
+    if rate_unit is not None:
+        state["rate_unit"] = rate_unit
     if detail is not None:
         state["detail"] = detail
     if memory_status is not None:
