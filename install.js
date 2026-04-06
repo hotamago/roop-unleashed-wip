@@ -18,7 +18,7 @@ module.exports = {
         venv: "env",
         path: "app",
         message: [
-          "uv pip install -r requirements.txt"
+          "uv sync"
         ]
       }
     },

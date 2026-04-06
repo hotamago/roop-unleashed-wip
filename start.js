@@ -11,7 +11,7 @@ module.exports = {
         env: { GRADIO_SERVER_NAME: "127.0.0.1" },
         path: "app",
         message: [
-          "python run.py",
+          "uv run run.py",
         ],
         on: [{
           "event": "/(http:\\/\\/\\S+)/",
