@@ -108,6 +108,25 @@ def test_entry_signature_stays_stable_when_transient_target_moves_to_resume_cach
     assert sig_a == sig_b
 
 
+def test_entry_signature_uses_active_resume_key_instead_of_runtime_face_embeddings(tmp_path, monkeypatch):
+    media_path = tmp_path / "clip.mp4"
+    media_path.write_bytes(b"same-video")
+    options = make_options({"faceswap": {}})
+    entry = ProcessEntry(str(media_path), 0, 10, 30.0, file_signature="sha256:same-video")
+    monkeypatch.setattr(roop.globals, "active_resume_key", "resume-key-123", raising=False)
+    roop.globals.INPUT_FACESETS[:] = [SimpleNamespace(faces=[SimpleNamespace(embedding=np.array([1.0]), mask_offsets=[0])])]
+    roop.globals.TARGET_FACES[:] = [SimpleNamespace(embedding=np.array([2.0]))]
+
+    sig_a = get_entry_signature(entry, options, "File")
+
+    roop.globals.INPUT_FACESETS[:] = [SimpleNamespace(faces=[SimpleNamespace(embedding=np.array([999.0]), mask_offsets=[0])])]
+    roop.globals.TARGET_FACES[:] = [SimpleNamespace(embedding=np.array([555.0]))]
+
+    sig_b = get_entry_signature(entry, options, "File")
+
+    assert sig_a == sig_b
+
+
 def test_cleanup_job_dir_preserves_processing_cache_for_resume(tmp_path, monkeypatch):
     executor = StagedBatchExecutor("File", None, make_options({"faceswap": {}}))
     job_dir = tmp_path / "job-cache"

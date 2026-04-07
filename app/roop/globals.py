@@ -44,6 +44,7 @@ runtime_processing_status = 'Idle'
 runtime_processing_markdown = '**Process Info**\n- Status: Idle'
 runtime_processing_state = {}
 runtime_processing_last_log_at = 0.0
+active_resume_key = None
 
 g_current_face_analysis = None
 g_desired_face_analysis = None

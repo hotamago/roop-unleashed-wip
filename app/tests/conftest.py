@@ -34,6 +34,7 @@ def reset_runtime_globals(monkeypatch):
     monkeypatch.setattr(roop.globals, "runtime_processing_markdown", "**Process Info**\n- Status: Idle", raising=False)
     monkeypatch.setattr(roop.globals, "runtime_processing_state", {}, raising=False)
     monkeypatch.setattr(roop.globals, "runtime_processing_last_log_at", 0.0, raising=False)
+    monkeypatch.setattr(roop.globals, "active_resume_key", None, raising=False)
     monkeypatch.setattr(roop.globals, "INPUT_FACESETS", [], raising=False)
     monkeypatch.setattr(roop.globals, "TARGET_FACES", [], raising=False)
     monkeypatch.setattr(ui.globals, "ui_input_thumbs", [], raising=False)

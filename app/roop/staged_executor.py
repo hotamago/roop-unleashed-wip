@@ -135,11 +135,10 @@ def get_entry_signature(entry, options, output_method):
             "start": entry.startframe,
             "end": entry.endframe,
         }
+    active_resume_key = getattr(roop.globals, "active_resume_key", None)
     signature = {
         "pipeline_version": PIPELINE_VERSION,
         "file": file_identity,
-        "inputs": hash_facesets(roop.globals.INPUT_FACESETS),
-        "targets": hash_target_faces(roop.globals.TARGET_FACES),
         "provider": str(roop.globals.execution_providers),
         "output_method": output_method,
         "detect_pack_frame_count": getattr(roop.globals.CFG, "detect_pack_frame_count", DETECT_PACK_FRAME_COUNT),
@@ -162,6 +161,11 @@ def get_entry_signature(entry, options, output_method):
             "show_face_area_overlay": options.show_face_area_overlay,
         },
     }
+    if active_resume_key:
+        signature["resume_key"] = active_resume_key
+    else:
+        signature["inputs"] = hash_facesets(roop.globals.INPUT_FACESETS)
+        signature["targets"] = hash_target_faces(roop.globals.TARGET_FACES)
     return hashlib.sha256(json_dumps(signature).encode("utf-8")).hexdigest()
 
 

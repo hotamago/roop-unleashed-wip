@@ -413,11 +413,11 @@ def write_resume_payload_with_result(payload):
     with open(resume_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=True)
     ui.globals.ui_resume_last_path = resume_path
-    return resume_path, reused_existing
+    return resume_path, reused_existing, resume_key
 
 
 def write_resume_payload(payload):
-    resume_path, _ = write_resume_payload_with_result(payload)
+    resume_path, _, _ = write_resume_payload_with_result(payload)
     return resume_path
 
 
@@ -613,6 +613,7 @@ def load_resume_into_runtime(resume_path):
     global selected_preview_index, SELECTED_INPUT_FACE_INDEX, SELECTED_TARGET_FACE_INDEX
 
     payload = read_resume_payload(resume_path)
+    roop.globals.active_resume_key = payload.get("resume_key") or get_resume_payload_signature(payload)
     restore_input_faces_from_resume(payload.get("sources") or [])
     target_paths = restore_process_entries((payload.get("targets") or {}).get("files") or [])
     restore_target_faces_from_resume((payload.get("targets") or {}).get("selected_faces") or [])
@@ -1432,7 +1433,8 @@ def save_resume_snapshot_for_run(output_method, enhancer, detection, keep_frames
         restore_original_mouth, num_swap_steps, upsample
     )
     payload = build_resume_payload(settings)
-    resume_path, reused_existing = write_resume_payload_with_result(payload)
+    resume_path, reused_existing, resume_key = write_resume_payload_with_result(payload)
+    roop.globals.active_resume_key = resume_key
     status_detail = "Reused existing resume config for this run" if reused_existing else "Saved resume config for this run"
     return resume_path, get_resume_status_markdown(resume_path, status_detail), reused_existing
 
@@ -1491,6 +1493,7 @@ def start_swap( output_method, enhancer, detection, keep_frames, wait_after_extr
         else:
             gr.Info(f"Resume config saved: {resume_path}")
     except Exception as exc:
+        roop.globals.active_resume_key = None
         resume_status = get_resume_status_markdown(ui.globals.ui_resume_last_path, f"Resume config was not saved: {exc}")
         gr.Warning(f"Resume config was not saved for this run: {exc}")
     yield gr.Button(variant="secondary", interactive=False), gr.Button(variant="primary", interactive=True), get_processing_status_markdown(), resume_status
