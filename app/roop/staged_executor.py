@@ -32,8 +32,22 @@ def get_jobs_root():
     return jobs_root
 
 
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def json_dumps(data):
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    return json.dumps(make_json_safe(data), sort_keys=True, separators=(",", ":"))
 
 
 def write_json(path: Path, data):
