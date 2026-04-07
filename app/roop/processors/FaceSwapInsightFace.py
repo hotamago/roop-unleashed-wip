@@ -17,6 +17,7 @@ class FaceSwapInsightFace():
     type = 'swap'
     supports_batch = True
     batch_size_limit = None
+    supports_parallel_single_batch = True
 
 
     def Initialize(self, plugin_options:dict):
@@ -59,6 +60,12 @@ class FaceSwapInsightFace():
         if self.batch_size_limit is not None:
             effective_batch_size = min(effective_batch_size, max(1, int(self.batch_size_limit)))
         return effective_batch_size
+
+
+    def CreateWorkerProcessor(self):
+        worker = FaceSwapInsightFace()
+        worker.Initialize(dict(self.plugin_options or {}))
+        return worker
 
 
 

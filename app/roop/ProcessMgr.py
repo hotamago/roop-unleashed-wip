@@ -371,6 +371,9 @@ class ProcessMgr():
                 "current_frames": current_frames,
             })
 
+        if self.should_parallelize_single_batch(processor):
+            return self.run_swap_tasks_parallel_single_batch(prepared_tasks, processor)
+
         for _ in range(0, self.options.num_swap_steps):
             prepared_frames = []
             source_faces = []
@@ -398,6 +401,104 @@ class ProcessMgr():
         for prepared_task in prepared_tasks:
             fake_frame = self.explode_pixel_boost(prepared_task["current_frames"], model_output_size, subsample_total, self.options.subsample_size)
             outputs[prepared_task["cache_key"]] = fake_frame.astype(np.uint8)
+        return outputs
+
+
+    def should_parallelize_single_batch(self, processor):
+        batch_limit = getattr(processor, "batch_size_limit", None)
+        supports_parallel_single_batch = getattr(processor, "supports_parallel_single_batch", False)
+        return supports_parallel_single_batch and batch_limit == 1 and hasattr(processor, "CreateWorkerProcessor")
+
+
+    def get_single_batch_worker_count(self, processor):
+        if not self.should_parallelize_single_batch(processor):
+            return 1
+        vram_budget = None
+        active_plan = getattr(roop.globals, "active_memory_plan", None)
+        if isinstance(active_plan, dict):
+            vram_budget = active_plan.get("vram_budget_gb")
+            explicit_workers = active_plan.get("swap_single_batch_workers")
+            if explicit_workers is not None:
+                return max(1, int(explicit_workers))
+        if roop.globals.execution_providers and any(name in str(roop.globals.execution_providers[0]) for name in ("CUDAExecutionProvider", "ROCMExecutionProvider", "TensorrtExecutionProvider")):
+            if vram_budget is None or vram_budget < 8.0:
+                return 1
+            if vram_budget < 16.0:
+                return 2
+            if vram_budget < 24.0:
+                return 3
+            return 4
+        return min(max(1, self.num_threads or 1), 4)
+
+
+    def run_prepared_swap_task(self, prepared_task, processor):
+        current_frames = [frame.copy() for frame in prepared_task["current_frames"]]
+        for _ in range(0, self.options.num_swap_steps):
+            next_frames = []
+            for current_frame in current_frames:
+                prepared_frame = self.prepare_crop_frame(current_frame)
+                output = processor.Run(prepared_task["input_face"], prepared_task["target_face"], prepared_frame)
+                next_frames.append(self.normalize_swap_frame(output))
+            current_frames = next_frames
+        model_output_size = 128
+        subsample_total = max(self.options.subsample_size // model_output_size, 1)
+        fake_frame = self.explode_pixel_boost(current_frames, model_output_size, subsample_total, self.options.subsample_size)
+        return fake_frame.astype(np.uint8)
+
+
+    def run_swap_tasks_parallel_single_batch(self, prepared_tasks, processor):
+        worker_count = min(self.get_single_batch_worker_count(processor), len(prepared_tasks))
+        if worker_count <= 1:
+            outputs = {}
+            for prepared_task in prepared_tasks:
+                outputs[prepared_task["cache_key"]] = self.run_prepared_swap_task(prepared_task, processor)
+            return outputs
+
+        worker_processors = [processor]
+        worker_processors.extend(processor.CreateWorkerProcessor() for _ in range(worker_count - 1))
+        task_queue = Queue(maxsize=max(worker_count * 2, 2))
+        outputs = {}
+        output_lock = Lock()
+        worker_error = {"exc": None}
+
+        def worker_loop(worker_processor):
+            while True:
+                item = task_queue.get()
+                try:
+                    if item is None:
+                        return
+                    if worker_error["exc"] is not None:
+                        continue
+                    prepared_task = item
+                    fake_frame = self.run_prepared_swap_task(prepared_task, worker_processor)
+                    with output_lock:
+                        outputs[prepared_task["cache_key"]] = fake_frame
+                except Exception as exc:
+                    with output_lock:
+                        if worker_error["exc"] is None:
+                            worker_error["exc"] = exc
+                finally:
+                    task_queue.task_done()
+
+        worker_threads = [Thread(target=worker_loop, args=(worker_processor,), daemon=True) for worker_processor in worker_processors]
+        try:
+            for worker_thread in worker_threads:
+                worker_thread.start()
+            for prepared_task in prepared_tasks:
+                task_queue.put(prepared_task, block=True)
+            for _ in worker_threads:
+                task_queue.put(None, block=True)
+            task_queue.join()
+            for worker_thread in worker_threads:
+                worker_thread.join()
+            if worker_error["exc"] is not None:
+                raise worker_error["exc"]
+        finally:
+            for worker_processor in worker_processors[1:]:
+                try:
+                    worker_processor.Release()
+                except Exception:
+                    pass
         return outputs
 
 

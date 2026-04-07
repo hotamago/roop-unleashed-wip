@@ -40,6 +40,19 @@ def get_available_vram_gb() -> Optional[float]:
         return None
 
 
+def resolve_single_batch_worker_cap(vram_budget_gb: Optional[float]) -> int:
+    if provider_uses_gpu() and vram_budget_gb is not None and vram_budget_gb > 0:
+        if vram_budget_gb < 8.0:
+            return 1
+        if vram_budget_gb < 16.0:
+            return 2
+        if vram_budget_gb < 24.0:
+            return 3
+        return 4
+    max_threads = max(1, int(getattr(roop.globals.CFG, "max_threads", 1) or 1))
+    return min(max_threads, 4)
+
+
 def resolve_memory_plan(width: int = 0, height: int = 0) -> dict:
     cfg = roop.globals.CFG
     available_ram = get_available_ram_gb()
@@ -86,6 +99,7 @@ def resolve_memory_plan(width: int = 0, height: int = 0) -> dict:
         "chunk_size": chunk_size,
         "prefetch_frames": prefetch_frames,
         "swap_batch_size": swap_batch,
+        "swap_single_batch_workers": resolve_single_batch_worker_cap(vram_budget),
         "mask_batch_size": mask_batch,
         "enhance_batch_size": enhance_batch,
         "detect_pack_frame_count": max(8, int(getattr(cfg, "detect_pack_frame_count", 256) or 256)),
@@ -108,6 +122,6 @@ def describe_memory_plan(plan: Optional[dict] = None) -> str:
     return (
         f"Memory budget: {plan['mode']} | {ram} | {vram} | "
         f"chunk={plan['chunk_size']} | detect pack={plan['detect_pack_frame_count']} | prefetch={plan['prefetch_frames']} | "
-        f"swap batch={plan['swap_batch_size']} | mask batch={plan['mask_batch_size']} | "
+        f"swap batch={plan['swap_batch_size']} | swap workers={plan['swap_single_batch_workers']} | mask batch={plan['mask_batch_size']} | "
         f"enhance batch={plan['enhance_batch_size']}"
     )
