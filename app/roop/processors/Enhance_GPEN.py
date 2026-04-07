@@ -4,7 +4,7 @@ import numpy as np
 import onnxruntime
 import roop.globals
 
-from roop.onnx_batch import ensure_native_batch_model
+from roop.onnx_runtime import get_execution_providers_for_processor, resolve_model_path_for_processor
 from roop.typing import Face, Frame, FaceSet
 from roop.utilities import resolve_relative_path
 
@@ -30,8 +30,12 @@ class Enhance_GPEN():
 
         self.plugin_options = plugin_options
         if self.model_gpen is None:
-            model_path = ensure_native_batch_model(resolve_relative_path('../models/GPEN-BFR-512.onnx'))
-            self.model_gpen = onnxruntime.InferenceSession(model_path, None, providers=roop.globals.execution_providers)
+            model_path = resolve_model_path_for_processor(resolve_relative_path('../models/GPEN-BFR-512.onnx'), self.processorname)
+            self.model_gpen = onnxruntime.InferenceSession(
+                model_path,
+                None,
+                providers=get_execution_providers_for_processor(self.processorname),
+            )
             # replace Mac mps with cpu for the moment
             self.devicename = self.plugin_options["devicename"].replace('mps', 'cpu')
 

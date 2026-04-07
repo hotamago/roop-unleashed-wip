@@ -87,8 +87,8 @@ def test_faceswap_insightface_initialize_uses_native_batch_model(monkeypatch):
 
     try:
         monkeypatch.setattr(
-            "roop.processors.FaceSwapInsightFace.ensure_native_batch_model",
-            lambda model_path: "patched.onnx",
+            "roop.processors.FaceSwapInsightFace.resolve_model_path_for_processor",
+            lambda model_path, _processor_name: "patched.onnx",
         )
     except AttributeError as exc:
         raise AssertionError("FaceSwapInsightFace should import native batch helper") from exc

@@ -4,7 +4,7 @@ import onnxruntime
 import threading
 import roop.globals
 
-from roop.onnx_batch import ensure_native_batch_model
+from roop.onnx_runtime import get_execution_providers_for_processor, resolve_model_path_for_processor
 from roop.typing import Frame
 from roop.utilities import resolve_relative_path
 
@@ -28,9 +28,13 @@ class Mask_XSeg():
 
         self.plugin_options = plugin_options
         if self.model_xseg is None:
-            model_path = ensure_native_batch_model(resolve_relative_path('../models/xseg.onnx'))
+            model_path = resolve_model_path_for_processor(resolve_relative_path('../models/xseg.onnx'), self.processorname)
             onnxruntime.set_default_logger_severity(3)
-            self.model_xseg = onnxruntime.InferenceSession(model_path, None, providers=roop.globals.execution_providers)
+            self.model_xseg = onnxruntime.InferenceSession(
+                model_path,
+                None,
+                providers=get_execution_providers_for_processor(self.processorname),
+            )
             self.model_inputs = self.model_xseg.get_inputs()
             self.model_outputs = self.model_xseg.get_outputs()
 

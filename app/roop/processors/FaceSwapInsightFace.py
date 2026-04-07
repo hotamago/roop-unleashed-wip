@@ -4,7 +4,7 @@ import numpy as np
 import onnx
 import onnxruntime
 
-from roop.onnx_batch import ensure_native_batch_model
+from roop.onnx_runtime import get_execution_providers_for_processor, resolve_model_path_for_processor
 from roop.typing import Face, Frame
 from roop.utilities import resolve_relative_path
 
@@ -32,14 +32,18 @@ class FaceSwapInsightFace():
             original_model_path = resolve_relative_path('../models/inswapper_128.onnx')
             graph = onnx.load(original_model_path).graph
             self.emap = onnx.numpy_helper.to_array(graph.initializer[-1])
-            model_path = ensure_native_batch_model(original_model_path)
+            model_path = resolve_model_path_for_processor(original_model_path, self.processorname)
             self.devicename = self.plugin_options["devicename"].replace('mps', 'cpu')
             self.input_mean = 0.0
             self.input_std = 255.0
             #cuda_options = {"arena_extend_strategy": "kSameAsRequested", 'cudnn_conv_algo_search': 'DEFAULT'}            
             sess_options = onnxruntime.SessionOptions()
             sess_options.enable_cpu_mem_arena = False
-            self.model_swap_insightface = onnxruntime.InferenceSession(model_path, sess_options, providers=roop.globals.execution_providers)
+            self.model_swap_insightface = onnxruntime.InferenceSession(
+                model_path,
+                sess_options,
+                providers=get_execution_providers_for_processor(self.processorname),
+            )
             self.batch_size_limit = self._resolve_batch_size_limit()
             self.supports_batch = self.batch_size_limit is None or self.batch_size_limit > 1
         self.source_latent_cache = {}

@@ -38,6 +38,7 @@ from roop.ProcessEntry import ProcessEntry
 from roop.ProcessMgr import ProcessMgr
 from roop.ProcessOptions import ProcessOptions
 from roop.capturer import get_video_frame_total, release_video
+from roop.memory import get_available_vram_gb
 from roop.progress_status import finish_processing_status, set_processing_message
 from roop.staged_executor import StagedBatchExecutor
 
@@ -72,24 +73,80 @@ def encode_execution_providers(execution_providers: List[str]) -> List[str]:
     return [execution_provider.replace('ExecutionProvider', '').lower() for execution_provider in execution_providers]
 
 
+def _build_cuda_execution_provider():
+    torch.cuda.set_device(roop.globals.cuda_device_id)
+    return ('CUDAExecutionProvider', {'device_id': roop.globals.cuda_device_id})
+
+
+def _supports_tensorrt_fp16() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _minor = torch.cuda.get_device_capability(roop.globals.cuda_device_id)
+        return major >= 7
+    except Exception:
+        return False
+
+
+def _resolve_trt_workspace_size() -> int:
+    available_vram_gb = get_available_vram_gb()
+    if available_vram_gb is None:
+        workspace_gb = 2.0
+    else:
+        workspace_gb = max(1.0, min(6.0, available_vram_gb * 0.5))
+    return int(workspace_gb * (1024 ** 3))
+
+
+def _build_tensorrt_execution_provider():
+    trt_cache = str(pathlib.Path(__file__).parent.parent / 'models' / 'trt_cache')
+    os.makedirs(trt_cache, exist_ok=True)
+    return ('TensorrtExecutionProvider', {
+        'device_id': roop.globals.cuda_device_id,
+        'trt_fp16_enable': _supports_tensorrt_fp16(),
+        'trt_max_workspace_size': _resolve_trt_workspace_size(),
+        'trt_engine_cache_enable': True,
+        'trt_engine_cache_path': trt_cache,
+        'trt_timing_cache_enable': True,
+        'trt_timing_cache_path': trt_cache,
+    })
+
+
 def decode_execution_providers(execution_providers: List[str]) -> List[str]:
     import onnxruntime
-    list_providers = [provider for provider, encoded_execution_provider in zip(onnxruntime.get_available_providers(), encode_execution_providers(onnxruntime.get_available_providers()))
-            if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
-    
+    available_providers = onnxruntime.get_available_providers()
+    encoded_available_providers = encode_execution_providers(available_providers)
+    requested_providers = [str(provider).lower() for provider in execution_providers]
+    list_providers = [
+        provider
+        for provider, encoded_execution_provider in zip(available_providers, encoded_available_providers)
+        if any(execution_provider in encoded_execution_provider for execution_provider in requested_providers)
+    ]
+
     try:
-        for i in range(len(list_providers)):
-            if list_providers[i] == 'CUDAExecutionProvider':
-                list_providers[i] = ('CUDAExecutionProvider', {'device_id': roop.globals.cuda_device_id})
-                torch.cuda.set_device(roop.globals.cuda_device_id)
-            elif list_providers[i] == 'TensorrtExecutionProvider':
-                trt_cache = str(pathlib.Path(__file__).parent.parent / 'models' / 'trt_cache')
-                os.makedirs(trt_cache, exist_ok=True)
-                list_providers[i] = ('TensorrtExecutionProvider', {
-                    'device_id': roop.globals.cuda_device_id,
-                    'trt_engine_cache_enable': True,
-                    'trt_engine_cache_path': trt_cache,
-                })
+        if 'tensorrt' in requested_providers and 'TensorrtExecutionProvider' in available_providers:
+            prioritized_providers = [_build_tensorrt_execution_provider()]
+            if 'CUDAExecutionProvider' in available_providers:
+                prioritized_providers.append(_build_cuda_execution_provider())
+            if 'CPUExecutionProvider' in available_providers:
+                prioritized_providers.append('CPUExecutionProvider')
+            return prioritized_providers
+
+        normalized_providers = []
+        for provider in list_providers:
+            if provider == 'CUDAExecutionProvider':
+                normalized_providers.append(_build_cuda_execution_provider())
+            elif provider == 'TensorrtExecutionProvider':
+                normalized_providers.append(_build_tensorrt_execution_provider())
+            else:
+                normalized_providers.append(provider)
+        if normalized_providers and 'CPUExecutionProvider' in available_providers:
+            if not any(
+                provider == 'CPUExecutionProvider' or (isinstance(provider, tuple) and provider[0] == 'CPUExecutionProvider')
+                for provider in normalized_providers
+            ):
+                normalized_providers.append('CPUExecutionProvider')
+        if normalized_providers:
+            return normalized_providers
     except:
         pass
 

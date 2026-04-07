@@ -1,10 +1,8 @@
-from typing import Any, List, Callable
 import cv2 
 import numpy as np
 import onnxruntime
-import roop.globals
 
-from roop.onnx_batch import ensure_native_batch_model
+from roop.onnx_runtime import get_execution_providers_for_processor, resolve_model_path_for_processor
 from roop.typing import Face, Frame, FaceSet
 from roop.utilities import resolve_relative_path
 
@@ -30,8 +28,12 @@ class Enhance_RestoreFormerPPlus():
         if self.model_restoreformerpplus is None:
             # replace Mac mps with cpu for the moment
             self.devicename = self.plugin_options["devicename"].replace('mps', 'cpu')
-            model_path = ensure_native_batch_model(resolve_relative_path('../models/restoreformer_plus_plus.onnx'))
-            self.model_restoreformerpplus = onnxruntime.InferenceSession(model_path, None, providers=roop.globals.execution_providers)
+            model_path = resolve_model_path_for_processor(resolve_relative_path('../models/restoreformer_plus_plus.onnx'), self.processorname)
+            self.model_restoreformerpplus = onnxruntime.InferenceSession(
+                model_path,
+                None,
+                providers=get_execution_providers_for_processor(self.processorname),
+            )
             self.model_inputs = self.model_restoreformerpplus.get_inputs()
             model_outputs = self.model_restoreformerpplus.get_outputs()
             self.io_binding = self.model_restoreformerpplus.io_binding()
