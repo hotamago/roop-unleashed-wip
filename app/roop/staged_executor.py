@@ -135,6 +135,8 @@ def get_entry_signature(entry, options, output_method):
         "memory_mode": roop.globals.CFG.memory_mode,
         "max_ram_gb": roop.globals.CFG.max_ram_gb,
         "max_vram_gb": roop.globals.CFG.max_vram_gb,
+        "detect_pack_frame_count": getattr(roop.globals.CFG, "detect_pack_frame_count", DETECT_PACK_FRAME_COUNT),
+        "staged_chunk_size": getattr(roop.globals.CFG, "staged_chunk_size", 0),
         "options": {
             "processors": list(options.processors.keys()),
             "face_distance_threshold": options.face_distance_threshold,
