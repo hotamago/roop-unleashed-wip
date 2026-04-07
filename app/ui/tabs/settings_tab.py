@@ -47,6 +47,8 @@ def settings_tab():
             with gr.Column():
                 max_ram_gb = gr.Slider(0, 128, value=roop.globals.CFG.max_ram_gb, label="Max. RAM to use (Gb)", info='0 meaning auto/unset', step=1.0, interactive=True)
                 max_vram_gb = gr.Slider(0, 64, value=roop.globals.CFG.max_vram_gb, label="Max. VRAM to use (Gb)", info='0 meaning auto/unset', step=0.5, interactive=True)
+                staged_chunk_size = gr.Slider(0, 480, value=roop.globals.CFG.staged_chunk_size, label="Staged Chunk Size", info='0 meaning auto/unset', step=1.0, interactive=True)
+                detect_pack_frame_count = gr.Slider(8, 1024, value=roop.globals.CFG.detect_pack_frame_count, label="Detect Pack Frame Count", info='Packed detect metadata frames per cache blob', step=8.0, interactive=True)
                 settings_controls.append(gr.Dropdown(image_formats, label="Image Output Format", info='default: png', value=roop.globals.CFG.output_image_format, elem_id='output_image_format', interactive=True))
             with gr.Column():
                 settings_controls.append(gr.Dropdown(video_codecs, label="Video Codec", info='default: libx264', value=roop.globals.CFG.output_video_codec, elem_id='output_video_codec', interactive=True))
@@ -71,6 +73,8 @@ def settings_tab():
     max_threads.input(fn=lambda a,b='max_threads':on_settings_changed_misc(a,b), inputs=[max_threads], outputs=[memory_status])
     max_ram_gb.input(fn=lambda a,b='max_ram_gb':on_settings_changed_misc(a,b), inputs=[max_ram_gb], outputs=[memory_status])
     max_vram_gb.input(fn=lambda a,b='max_vram_gb':on_settings_changed_misc(a,b), inputs=[max_vram_gb], outputs=[memory_status])
+    staged_chunk_size.input(fn=lambda a,b='staged_chunk_size':on_settings_changed_misc(a,b), inputs=[staged_chunk_size], outputs=[memory_status])
+    detect_pack_frame_count.input(fn=lambda a,b='detect_pack_frame_count':on_settings_changed_misc(a,b), inputs=[detect_pack_frame_count], outputs=[memory_status])
     video_quality.input(fn=lambda a,b='video_quality':on_settings_changed_misc(a,b), inputs=[video_quality], outputs=[memory_status])
 
     button_clean_temp.click(fn=clean_temp)
@@ -122,6 +126,8 @@ def on_option_changed(evt: gr.SelectData):
 
 def on_settings_changed_misc(new_val, attribname):
     if hasattr(roop.globals.CFG, attribname):
+        if attribname in ('max_threads', 'video_quality', 'staged_chunk_size', 'detect_pack_frame_count'):
+            new_val = int(new_val)
         setattr(roop.globals.CFG, attribname, new_val)
         if attribname == 'max_ram_gb':
             roop.globals.CFG.memory_limit = new_val

@@ -15,6 +15,8 @@ def _default_state():
         "total_files": None,
         "chunk_index": None,
         "total_chunks": None,
+        "current_step": None,
+        "total_steps": None,
         "completed": 0,
         "total": 0,
         "unit": "units",
@@ -100,6 +102,11 @@ def render_status_line(state):
     if _is_number(chunk_index) and _is_number(total_chunks) and total_chunks > 0:
         parts.append(f"Chunk: {int(chunk_index)}/{int(total_chunks)}")
 
+    current_step = state.get("current_step")
+    total_steps = state.get("total_steps")
+    if _is_number(current_step) and _is_number(total_steps) and total_steps > 0:
+        parts.append(f"Pipeline: {int(current_step)}/{int(total_steps)}")
+
     progress_text = _format_progress_value(state.get("completed", 0), state.get("total", 0), state.get("unit", "units"))
     if progress_text:
         parts.append(f"Progress: {progress_text}")
@@ -154,6 +161,11 @@ def render_status_markdown(state):
     total_chunks = state.get("total_chunks")
     if _is_number(chunk_index) and _is_number(total_chunks) and total_chunks > 0:
         lines.append(f"- Chunk: {int(chunk_index)}/{int(total_chunks)}")
+
+    current_step = state.get("current_step")
+    total_steps = state.get("total_steps")
+    if _is_number(current_step) and _is_number(total_steps) and total_steps > 0:
+        lines.append(f"- Pipeline step: {int(current_step)}/{int(total_steps)}")
 
     progress_text = _format_progress_value(state.get("completed", 0), state.get("total", 0), state.get("unit", "units"))
     if progress_text:
@@ -234,7 +246,7 @@ def start_processing_status(message="Preparing faceswap job", total=None, unit="
     return _apply_state(state, force_log=True)
 
 
-def set_processing_message(message, status=None, stage=None, target_name=None, file_index=None, total_files=None, chunk_index=None, total_chunks=None, detail=None, memory_status=None, force_log=False):
+def set_processing_message(message, status=None, stage=None, target_name=None, file_index=None, total_files=None, chunk_index=None, total_chunks=None, current_step=None, total_steps=None, detail=None, memory_status=None, force_log=False):
     state = _ensure_state()
     if status is not None:
         state["status"] = status
@@ -252,6 +264,10 @@ def set_processing_message(message, status=None, stage=None, target_name=None, f
         state["chunk_index"] = chunk_index
     if total_chunks is not None:
         state["total_chunks"] = total_chunks
+    if current_step is not None:
+        state["current_step"] = current_step
+    if total_steps is not None:
+        state["total_steps"] = total_steps
     if detail is not None:
         state["detail"] = detail
     if memory_status is not None:
@@ -268,7 +284,7 @@ def set_memory_status(memory_status):
     return _apply_state(state, force_log=False)
 
 
-def publish_processing_progress(stage=None, completed=None, total=None, unit=None, target_name=None, file_index=None, total_files=None, chunk_index=None, total_chunks=None, step_completed=None, step_total=None, step_unit=None, rate=None, rate_unit=None, elapsed=None, eta=None, detail=None, memory_status=None, force_log=False):
+def publish_processing_progress(stage=None, completed=None, total=None, unit=None, target_name=None, file_index=None, total_files=None, chunk_index=None, total_chunks=None, current_step=None, total_steps=None, step_completed=None, step_total=None, step_unit=None, rate=None, rate_unit=None, elapsed=None, eta=None, detail=None, memory_status=None, force_log=False):
     state = _ensure_state()
     now = time.time()
 
@@ -294,6 +310,10 @@ def publish_processing_progress(stage=None, completed=None, total=None, unit=Non
         state["chunk_index"] = chunk_index
     if total_chunks is not None:
         state["total_chunks"] = total_chunks
+    if current_step is not None:
+        state["current_step"] = current_step
+    if total_steps is not None:
+        state["total_steps"] = total_steps
     if step_completed is not None:
         state["step_completed"] = step_completed
     if step_total is not None:

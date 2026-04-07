@@ -5,6 +5,8 @@ memory_limit: 0
 memory_mode: smart
 max_ram_gb: 0
 max_vram_gb: 0
+detect_pack_frame_count: 256
+staged_chunk_size: 0
 output_image_format: png
 output_template: '{file}_{time}'
 output_video_codec: libx264

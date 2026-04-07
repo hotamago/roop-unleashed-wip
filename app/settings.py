@@ -35,6 +35,8 @@ class Settings:
         self.memory_mode = self.default_get(data, 'memory_mode', 'smart')
         self.max_ram_gb = self.default_get(data, 'max_ram_gb', legacy_memory_limit)
         self.max_vram_gb = self.default_get(data, 'max_vram_gb', 0)
+        self.detect_pack_frame_count = self.default_get(data, 'detect_pack_frame_count', 256)
+        self.staged_chunk_size = self.default_get(data, 'staged_chunk_size', 0)
         self.memory_limit = self.max_ram_gb
         self.provider = self.default_get(data, 'provider', 'cuda')
         self.force_cpu = self.default_get(data, 'force_cpu', False)
@@ -96,6 +98,8 @@ class Settings:
             'memory_mode': self.memory_mode,
             'max_ram_gb': self.max_ram_gb,
             'max_vram_gb': self.max_vram_gb,
+            'detect_pack_frame_count': self.detect_pack_frame_count,
+            'staged_chunk_size': self.staged_chunk_size,
             'memory_limit' : self.max_ram_gb,
             'provider' : self.provider,
             'force_cpu' : self.force_cpu,

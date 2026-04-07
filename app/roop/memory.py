@@ -65,6 +65,8 @@ def resolve_memory_plan(width: int = 0, height: int = 0) -> dict:
     approx_frame_cost = max(frame_bytes * 6, 1)
     chunk_size = int(ram_budget_bytes / approx_frame_cost)
     chunk_size = max(8, min(chunk_size, 240))
+    if getattr(cfg, "staged_chunk_size", 0):
+        chunk_size = max(8, min(int(cfg.staged_chunk_size), 480))
 
     swap_batch = 1
     mask_batch = 1
@@ -86,6 +88,7 @@ def resolve_memory_plan(width: int = 0, height: int = 0) -> dict:
         "swap_batch_size": swap_batch,
         "mask_batch_size": mask_batch,
         "enhance_batch_size": enhance_batch,
+        "detect_pack_frame_count": max(8, int(getattr(cfg, "detect_pack_frame_count", 256) or 256)),
     }
     roop.globals.active_memory_plan = plan
     roop.globals.runtime_memory_status = describe_memory_plan(plan)
@@ -104,7 +107,7 @@ def describe_memory_plan(plan: Optional[dict] = None) -> str:
         vram = f"{plan['vram_budget_gb']:.2f} GB VRAM"
     return (
         f"Memory budget: {plan['mode']} | {ram} | {vram} | "
-        f"chunk={plan['chunk_size']} | prefetch={plan['prefetch_frames']} | "
+        f"chunk={plan['chunk_size']} | detect pack={plan['detect_pack_frame_count']} | prefetch={plan['prefetch_frames']} | "
         f"swap batch={plan['swap_batch_size']} | mask batch={plan['mask_batch_size']} | "
         f"enhance batch={plan['enhance_batch_size']}"
     )
