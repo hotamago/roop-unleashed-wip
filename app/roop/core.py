@@ -310,6 +310,18 @@ def live_swap(frame, options):
     return newframe
 
 
+def prepare_output_targets(files: list[ProcessEntry]) -> None:
+    for index, entry in enumerate(files):
+        fullname = entry.filename
+        if util.has_image_extension(fullname):
+            destination = util.get_destfilename_from_path(fullname, roop.globals.output_path, f'.{roop.globals.CFG.output_image_format}')
+            destination = util.replace_template(destination, index=index)
+            pathlib.Path(os.path.dirname(destination)).mkdir(parents=True, exist_ok=True)
+            entry.finalname = destination
+        elif util.is_video(fullname) or util.has_extension(fullname, ['gif']):
+            entry.finalname = util.get_destfilename_from_path(fullname, roop.globals.output_path, f'__temp.{roop.globals.CFG.output_video_format}')
+
+
 def batch_process_regular(output_method, files:list[ProcessEntry], masking_engine:str, new_clip_text:str, processing_mode, imagemask, restore_original_mouth, num_swap_steps, progress, selected_index = 0) -> None:
     global clip_text, process_mgr
 
@@ -340,6 +352,7 @@ def batch_process_regular(output_method, files:list[ProcessEntry], masking_engin
         batch_process_legacy(output_method, files, False)
         return
 
+    prepare_output_targets(files)
     executor = StagedBatchExecutor(output_method, progress, options)
     detail = "Packed detect cache + streaming aligned rebuild" if output_method == "File" else "Chunked packed cache + streaming aligned rebuild"
     set_processing_message("Running smart staged flow", stage="prepare", current_step=1, total_steps=smart_total_steps, detail=detail, force_log=True)
