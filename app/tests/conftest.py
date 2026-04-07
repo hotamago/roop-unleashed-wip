@@ -44,6 +44,7 @@ def reset_runtime_globals(monkeypatch):
     monkeypatch.setattr(ui.globals, "ui_target_files", [], raising=False)
     monkeypatch.setattr(ui.globals, "ui_target_face_refs", [], raising=False)
     monkeypatch.setattr(ui.globals, "ui_resume_last_path", None, raising=False)
+    monkeypatch.setattr(ui.globals, "ui_resume_bound_path", None, raising=False)
     faceswap_tab.list_files_process.clear()
     monkeypatch.setattr(faceswap_tab, "selected_preview_index", 0, raising=False)
     monkeypatch.setattr(faceswap_tab, "SELECTED_INPUT_FACE_INDEX", 0, raising=False)

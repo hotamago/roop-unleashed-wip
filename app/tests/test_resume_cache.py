@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -53,6 +54,24 @@ def test_write_and_read_resume_payload_roundtrip(tmp_path, monkeypatch):
     assert resume_path.endswith(".json")
     assert reloaded["version"] == faceswap_tab.RESUME_CACHE_VERSION
     assert reloaded["targets"]["files"][0]["filename"].endswith("target.mp4")
+
+
+def test_resume_payload_signature_ignores_performance_only_settings():
+    source_face_set = FaceSet()
+    source_face_set.faces.append(make_face())
+    roop.globals.INPUT_FACESETS.append(source_face_set)
+    roop.globals.TARGET_FACES.append(SimpleNamespace())
+    ui.globals.ui_input_face_refs.append({"type": "image_face", "path": "C:/source.png", "face_index": 0})
+    ui.globals.ui_target_face_refs.append({"path": "C:/target.mp4", "frame_number": 12, "face_index": 0})
+    faceswap_tab.list_files_process[:] = [ProcessEntry("C:/target.mp4", 0, 100, 24.0)]
+
+    payload_a = faceswap_tab.build_resume_payload({"output_method": "File"})
+    payload_b = faceswap_tab.build_resume_payload({"output_method": "File"})
+    payload_a["settings"]["mask_batch_size"] = 32
+    payload_b["settings"]["mask_batch_size"] = 84
+    payload_b["settings"]["swap_batch_size"] = 16
+
+    assert faceswap_tab.get_resume_payload_signature(payload_a) == faceswap_tab.get_resume_payload_signature(payload_b)
 
 
 def test_resume_job_signature_ignores_settings_changes():
@@ -136,6 +155,88 @@ def test_restore_input_faces_from_resume_uses_cached_snapshot_when_original_path
     ])
 
     assert restored_paths == [str(cached_source)]
+
+
+def test_write_resume_payload_prefers_ui_resume_bound_path_over_last_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(faceswap_tab, "get_resume_cache_root", lambda: str(tmp_path))
+    monkeypatch.setattr(faceswap_tab, "list_resume_cache_files", lambda: [], raising=False)
+    source_path = tmp_path / "gradio" / "source.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"source-image")
+    source_face_set = FaceSet()
+    source_face_set.faces.append(make_face())
+    roop.globals.INPUT_FACESETS.append(source_face_set)
+    ui.globals.ui_input_face_refs.append({"type": "image_face", "path": str(source_path), "face_index": 0})
+    roop.globals.TARGET_FACES.append(SimpleNamespace(embedding=np.array([0.1, 0.2], dtype=np.float32)))
+    ui.globals.ui_target_face_refs.append({"path": "C:/target.mp4", "frame_number": 0, "face_index": 0})
+    faceswap_tab.list_files_process[:] = [ProcessEntry("C:/target.mp4", 0, 100, 24.0)]
+
+    bound_file = tmp_path / "20260406_8d8d244889be.json"
+    bound_file.write_text("{}", encoding="utf-8")
+    wrong_last = tmp_path / "wrong_other.json"
+    wrong_last.write_text("{}", encoding="utf-8")
+    ui.globals.ui_resume_bound_path = str(bound_file)
+    ui.globals.ui_resume_last_path = str(wrong_last)
+
+    faceswap_tab.write_resume_payload(faceswap_tab.build_resume_payload({"output_method": "File"}))
+
+    assert bound_file.is_file()
+    assert faceswap_tab.read_resume_payload(str(bound_file)).get("version") == faceswap_tab.RESUME_CACHE_VERSION
+    assert len(list(tmp_path.glob("*.json"))) == 2
+
+
+def test_write_resume_payload_sticks_to_ui_resume_last_path_when_file_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr(faceswap_tab, "get_resume_cache_root", lambda: str(tmp_path))
+    monkeypatch.setattr(faceswap_tab, "list_resume_cache_files", lambda: [], raising=False)
+    source_path = tmp_path / "gradio" / "source.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"source-image")
+    source_face_set = FaceSet()
+    source_face_set.faces.append(make_face())
+    roop.globals.INPUT_FACESETS.append(source_face_set)
+    ui.globals.ui_input_face_refs.append({"type": "image_face", "path": str(source_path), "face_index": 0})
+    roop.globals.TARGET_FACES.append(SimpleNamespace(embedding=np.array([0.5, 0.25], dtype=np.float32)))
+    ui.globals.ui_target_face_refs.append({"path": "C:/target.mp4", "frame_number": 0, "face_index": 0})
+    faceswap_tab.list_files_process[:] = [ProcessEntry("C:/target.mp4", 0, 100, 24.0)]
+
+    loaded = tmp_path / "20260406_8d8d244889be.json"
+    loaded.write_text("{}", encoding="utf-8")
+    ui.globals.ui_resume_bound_path = None
+    ui.globals.ui_resume_last_path = str(loaded)
+
+    faceswap_tab.write_resume_payload(faceswap_tab.build_resume_payload({"output_method": "File"}))
+
+    assert loaded.is_file()
+    assert len(list(tmp_path.glob("*.json"))) == 1
+    reloaded = faceswap_tab.read_resume_payload(str(loaded))
+    assert reloaded.get("version") == faceswap_tab.RESUME_CACHE_VERSION
+
+
+def test_resolve_equivalent_resume_path_reuses_loaded_file_after_stripping_extra_json_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(faceswap_tab, "get_resume_cache_root", lambda: str(tmp_path))
+    monkeypatch.setattr(faceswap_tab, "list_resume_cache_files", lambda: [], raising=False)
+    source_path = tmp_path / "gradio" / "source.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"source-image")
+    source_face_set = FaceSet()
+    source_face_set.faces.append(make_face())
+    roop.globals.INPUT_FACESETS.append(source_face_set)
+    ui.globals.ui_input_face_refs.append({"type": "image_face", "path": str(source_path), "face_index": 0})
+    roop.globals.TARGET_FACES.append(SimpleNamespace(embedding=np.array([0.1, 0.2], dtype=np.float32)))
+    ui.globals.ui_target_face_refs.append({"path": "C:/target.mp4", "frame_number": 12, "face_index": 0})
+    faceswap_tab.list_files_process[:] = [ProcessEntry("C:/target.mp4", 0, 100, 24.0)]
+
+    first_path = faceswap_tab.write_resume_payload(faceswap_tab.build_resume_payload({"output_method": "File"}))
+    data = json.loads(Path(first_path).read_text(encoding="utf-8"))
+    data["client_debug_meta"] = {"x": 1}
+    Path(first_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    ui.globals.ui_resume_last_path = first_path
+    fresh = faceswap_tab.build_resume_payload({"output_method": "File"})
+    desired_path, _ = faceswap_tab.get_resume_payload_path(fresh)
+    resolved = faceswap_tab.resolve_equivalent_resume_path(fresh, desired_path)
+
+    assert os.path.normcase(os.path.normpath(resolved)) == os.path.normcase(os.path.normpath(first_path))
 
 
 def test_write_resume_payload_reuses_existing_file_for_equivalent_payload(tmp_path, monkeypatch):

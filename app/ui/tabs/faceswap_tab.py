@@ -41,6 +41,64 @@ manual_masking = False
 RESUME_CACHE_VERSION = 1
 FILE_SIGNATURE_CACHE = {}
 
+# Settings keys that only affect VRAM/throughput (memory_plan), not staged pipeline outputs.
+# They must not change resume filenames, resume_key, or processing_cache invalidation.
+RESUME_SETTINGS_PERF_KEYS = frozenset(
+    {
+        "mask_batch_size",
+        "swap_batch_size",
+        "enhance_batch_size",
+        "prefetch_frames",
+        "staged_chunk_size",
+        "detect_pack_frame_count",
+        "single_batch_workers",
+        "max_threads",
+        "video_quality",
+    }
+)
+
+RESUME_IDENTITY_ROOT_KEYS = frozenset({"version", "sources", "targets", "selection", "settings"})
+
+RESUME_SETTINGS_FLOAT_KEYS = frozenset({"face_distance", "blend_ratio"})
+
+
+def _normalize_embedding_for_resume_signature(face_ref: dict) -> None:
+    emb = face_ref.get("face_embedding")
+    if not isinstance(emb, list) or not emb:
+        return
+    face_ref["face_embedding"] = [float(f"{float(v):.6g}") for v in emb]
+
+
+def _normalize_numeric_fields_for_resume_identity(canonical: dict) -> None:
+    """Make disk vs runtime JSON compare equal (int/float quirks, fps precision)."""
+    for source_ref in canonical.get("sources") or []:
+        mo = source_ref.get("mask_offsets")
+        if isinstance(mo, list) and mo:
+            source_ref["mask_offsets"] = [float(f"{float(x):.6g}") for x in mo]
+    targets = canonical.get("targets") or {}
+    for target_entry in targets.get("files") or []:
+        if not isinstance(target_entry, dict):
+            continue
+        if "fps" in target_entry and target_entry["fps"] is not None:
+            target_entry["fps"] = float(f"{float(target_entry['fps']):.6g}")
+        for ik in ("startframe", "endframe"):
+            if ik in target_entry and target_entry[ik] is not None:
+                target_entry[ik] = int(target_entry[ik])
+    spi = targets.get("selected_preview_index")
+    if spi is not None:
+        targets["selected_preview_index"] = int(spi)
+    sel = canonical.get("selection") or {}
+    if isinstance(sel, dict):
+        if "input_face_index" in sel and sel["input_face_index"] is not None:
+            sel["input_face_index"] = int(sel["input_face_index"])
+        if "target_face_index" in sel and sel["target_face_index"] is not None:
+            sel["target_face_index"] = int(sel["target_face_index"])
+    settings = canonical.get("settings")
+    if isinstance(settings, dict):
+        for fk in RESUME_SETTINGS_FLOAT_KEYS:
+            if fk in settings and isinstance(settings[fk], (int, float)):
+                settings[fk] = float(f"{float(settings[fk]):.6g}")
+
 
 def default_mask_offsets():
     return [0, 0, 0, 0, 20.0, 10.0, 1.0, 1.0, 1.0, 1.0]
@@ -270,6 +328,9 @@ def get_resume_payload_identity(payload):
     canonical.pop("resume_key", None)
     canonical.pop("resume_job_key", None)
     canonical.pop("__path__", None)
+    for k in list(canonical.keys()):
+        if k not in RESUME_IDENTITY_ROOT_KEYS:
+            canonical.pop(k, None)
     for source_ref in canonical.get("sources") or []:
         source_ref["path"] = get_source_file_signature(source_ref) or source_ref.get("path")
         source_ref.pop("resume_cached_path", None)
@@ -284,6 +345,16 @@ def get_resume_payload_identity(payload):
         target_face_ref["path"] = get_target_file_signature(target_face_ref, "path") or target_face_ref.get("path")
         target_face_ref.pop("resume_cached_path", None)
         target_face_ref.pop("file_signature", None)
+        if "frame_number" in target_face_ref and target_face_ref["frame_number"] is not None:
+            target_face_ref["frame_number"] = int(target_face_ref["frame_number"])
+        if "face_index" in target_face_ref and target_face_ref["face_index"] is not None:
+            target_face_ref["face_index"] = int(target_face_ref["face_index"])
+        _normalize_embedding_for_resume_signature(target_face_ref)
+    settings = canonical.get("settings")
+    if isinstance(settings, dict):
+        for k in RESUME_SETTINGS_PERF_KEYS:
+            settings.pop(k, None)
+    _normalize_numeric_fields_for_resume_identity(canonical)
     return canonical
 
 
@@ -325,6 +396,14 @@ def resolve_equivalent_resume_path(payload, desired_resume_path):
     except Exception:
         return desired_resume_path
     if get_resume_payload_signature(active_payload) == get_resume_payload_signature(payload):
+        return active_resume_path
+    # Same faces/files/selection + same semantic settings, but hash drifted (legacy JSON, float noise, extra keys).
+    # Keep writing to the loaded resume path so resume_cache does not spawn a duplicate file.
+    if (
+        get_resume_job_signature(active_payload) == get_resume_job_signature(payload)
+        and get_resume_payload_identity(active_payload).get("settings")
+        == get_resume_payload_identity(payload).get("settings")
+    ):
         return active_resume_path
     return desired_resume_path
 
@@ -441,7 +520,19 @@ def snapshot_resume_target_files(payload, resume_path):
 def write_resume_payload_with_result(payload):
     payload = copy.deepcopy(payload)
     desired_resume_path, resume_key = get_resume_payload_path(payload)
-    resume_path = resolve_equivalent_resume_path(payload, desired_resume_path)
+    resume_path = None
+    bound = normalize_resume_path(getattr(ui.globals, "ui_resume_bound_path", None))
+    if bound:
+        if os.path.isfile(bound):
+            resume_path = bound
+        else:
+            ui.globals.ui_resume_bound_path = None
+    if resume_path is None:
+        sticky = normalize_resume_path(ui.globals.ui_resume_last_path)
+        if sticky and os.path.isfile(sticky):
+            resume_path = sticky
+        else:
+            resume_path = resolve_equivalent_resume_path(payload, desired_resume_path)
     payload["resume_key"] = resume_key
     payload["resume_job_key"] = get_resume_job_signature(payload)
     payload = snapshot_resume_source_files(payload, resume_path)
@@ -694,8 +785,10 @@ def load_resume_into_runtime(resume_path):
     global selected_preview_index, SELECTED_INPUT_FACE_INDEX, SELECTED_TARGET_FACE_INDEX
 
     payload = read_resume_payload(resume_path)
-    roop.globals.active_resume_key = payload.get("resume_key") or get_resume_payload_signature(payload)
-    roop.globals.active_resume_job_key = payload.get("resume_job_key") or get_resume_job_signature(payload)
+    # Always derive anchors from canonical identity so they stay aligned with processing_cache
+    # (staged_executor uses active_resume_key) even if older JSON stored a mismatched resume_key.
+    roop.globals.active_resume_key = get_resume_payload_signature(payload)
+    roop.globals.active_resume_job_key = get_resume_job_signature(payload)
     restore_input_faces_from_resume(payload.get("sources") or [])
     target_paths = restore_process_entries((payload.get("targets") or {}).get("files") or [])
     restore_target_faces_from_resume((payload.get("targets") or {}).get("selected_faces") or [])
@@ -713,6 +806,7 @@ def load_resume_into_runtime(resume_path):
     roop.globals.target_path = target_paths[selected_preview_index] if target_paths else None
     slider, frame_text = on_destfiles_selected(None)
     ui.globals.ui_resume_last_path = payload["__path__"]
+    ui.globals.ui_resume_bound_path = payload["__path__"]
     summary = f"Loaded {len(roop.globals.INPUT_FACESETS)} source face(s), {len(target_paths)} target file(s), {len(roop.globals.TARGET_FACES)} selected target face(s)"
     return {
         "payload": payload,
@@ -1457,6 +1551,7 @@ def on_clear_destfiles():
     global selected_preview_index
     clear_target_face_state()
     ui.globals.ui_target_files = []
+    ui.globals.ui_resume_bound_path = None
     list_files_process.clear()
     selected_preview_index = 0
     return ui.globals.ui_target_thumbs, gr.Slider(value=1, maximum=1, info='0:00:00'), '', ''
@@ -1517,8 +1612,13 @@ def save_resume_snapshot_for_run(output_method, enhancer, detection, keep_frames
     payload = build_resume_payload(settings)
     resume_job_key = get_resume_job_signature(payload)
     resume_path, reused_existing, resume_key = write_resume_payload_with_result(payload)
-    roop.globals.active_resume_key = resume_key
-    roop.globals.active_resume_job_key = resume_job_key
+    try:
+        verified_payload = read_resume_payload(resume_path)
+        roop.globals.active_resume_key = get_resume_payload_signature(verified_payload)
+        roop.globals.active_resume_job_key = get_resume_job_signature(verified_payload)
+    except Exception:
+        roop.globals.active_resume_key = resume_key
+        roop.globals.active_resume_job_key = resume_job_key
     status_detail = "Reused existing resume config for this run" if reused_existing else "Saved resume config for this run"
     return resume_path, get_resume_status_markdown(resume_path, status_detail), reused_existing
 

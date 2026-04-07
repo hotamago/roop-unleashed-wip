@@ -17,6 +17,8 @@ ui_memory_status = None
 ui_processing_info = None
 ui_resume_status = None
 ui_resume_last_path = None
+# Set only by "Resume From File" (load_resume_into_runtime). All resume JSON writes must go here until cleared.
+ui_resume_bound_path = None
 
 # Saveable faceswap session component refs
 ui_selected_face_detection = None
