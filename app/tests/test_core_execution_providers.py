@@ -25,7 +25,7 @@ def test_decode_execution_providers_tensorrt_includes_cuda_and_cpu_fallback(monk
 
 def test_decode_execution_providers_tensorrt_sets_cache_and_timing_options(monkeypatch, tmp_path):
     import onnxruntime
-    import roop.core.app
+    import roop.core.providers
     import torch
 
     monkeypatch.setattr(
@@ -36,7 +36,7 @@ def test_decode_execution_providers_tensorrt_sets_cache_and_timing_options(monke
     monkeypatch.setattr(torch.cuda, "set_device", lambda _device_id: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_id: (8, 9))
-    monkeypatch.setattr(roop.core.app, "get_available_vram_gb", lambda: 10.0)
+    monkeypatch.setattr(roop.core.providers, "get_available_vram_gb", lambda: 10.0)
     monkeypatch.setattr(roop.config.globals, "cuda_device_id", 0, raising=False)
 
     providers = decode_execution_providers(["tensorrt"])

@@ -9,7 +9,6 @@ if any(arg.startswith('--execution-provider') for arg in sys.argv):
 
 import warnings
 from typing import List
-import platform
 import signal
 import torch
 
@@ -40,6 +39,8 @@ from roop.media.capturer import get_video_frame_total, release_video
 from roop.memory import get_available_vram_gb
 from roop.progress.status import finish_processing_status, set_processing_message
 from roop.pipeline.staged_executor.executor import StagedBatchExecutor
+from roop.core import providers as core_providers
+from roop.core import resources as core_resources
 
 
 clip_text = None
@@ -69,146 +70,35 @@ def parse_args() -> None:
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
-    return [execution_provider.replace('ExecutionProvider', '').lower() for execution_provider in execution_providers]
-
-
-def _build_cuda_execution_provider():
-    torch.cuda.set_device(roop.config.globals.cuda_device_id)
-    return ('CUDAExecutionProvider', {'device_id': roop.config.globals.cuda_device_id})
-
-
-def _supports_tensorrt_fp16() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    try:
-        major, _minor = torch.cuda.get_device_capability(roop.config.globals.cuda_device_id)
-        return major >= 7
-    except Exception:
-        return False
-
-
-def _resolve_trt_workspace_size() -> int:
-    available_vram_gb = get_available_vram_gb()
-    if available_vram_gb is None:
-        workspace_gb = 2.0
-    else:
-        workspace_gb = max(1.0, min(6.0, available_vram_gb * 0.5))
-    return int(workspace_gb * (1024 ** 3))
-
-
-def _build_tensorrt_execution_provider():
-    trt_cache = str(pathlib.Path(__file__).resolve().parents[2] / 'models' / 'trt_cache')
-    os.makedirs(trt_cache, exist_ok=True)
-    return ('TensorrtExecutionProvider', {
-        'device_id': roop.config.globals.cuda_device_id,
-        'trt_fp16_enable': _supports_tensorrt_fp16(),
-        'trt_max_workspace_size': _resolve_trt_workspace_size(),
-        'trt_engine_cache_enable': True,
-        'trt_engine_cache_path': trt_cache,
-        'trt_timing_cache_enable': True,
-        'trt_timing_cache_path': trt_cache,
-    })
+    return core_providers.encode_execution_providers(execution_providers)
 
 
 def decode_execution_providers(execution_providers: List[str]) -> List[str]:
-    import onnxruntime
-    available_providers = onnxruntime.get_available_providers()
-    encoded_available_providers = encode_execution_providers(available_providers)
-    requested_providers = [str(provider).lower() for provider in execution_providers]
-    list_providers = [
-        provider
-        for provider, encoded_execution_provider in zip(available_providers, encoded_available_providers)
-        if any(execution_provider in encoded_execution_provider for execution_provider in requested_providers)
-    ]
-
-    try:
-        if 'tensorrt' in requested_providers and 'TensorrtExecutionProvider' in available_providers:
-            prioritized_providers = [_build_tensorrt_execution_provider()]
-            if 'CUDAExecutionProvider' in available_providers:
-                prioritized_providers.append(_build_cuda_execution_provider())
-            if 'CPUExecutionProvider' in available_providers:
-                prioritized_providers.append('CPUExecutionProvider')
-            return prioritized_providers
-
-        normalized_providers = []
-        for provider in list_providers:
-            if provider == 'CUDAExecutionProvider':
-                normalized_providers.append(_build_cuda_execution_provider())
-            elif provider == 'TensorrtExecutionProvider':
-                normalized_providers.append(_build_tensorrt_execution_provider())
-            else:
-                normalized_providers.append(provider)
-        if normalized_providers and 'CPUExecutionProvider' in available_providers:
-            if not any(
-                provider == 'CPUExecutionProvider' or (isinstance(provider, tuple) and provider[0] == 'CPUExecutionProvider')
-                for provider in normalized_providers
-            ):
-                normalized_providers.append('CPUExecutionProvider')
-        if normalized_providers:
-            return normalized_providers
-    except:
-        pass
-
-    return list_providers
+    return core_providers.decode_execution_providers(execution_providers)
     
 # Force GPU if available
 # roop.config.globals.execution_providers = decode_execution_providers(['cuda'])
 # print("Forced execution providers:", roop.config.globals.execution_providers)  # Debug
 
 def suggest_max_memory() -> int:
-    if platform.system().lower() == 'darwin':
-        return 4
-    return 16
+    return core_resources.suggest_max_memory()
 
 
 def suggest_execution_providers() -> List[str]:
-    import onnxruntime
-    return encode_execution_providers(onnxruntime.get_available_providers())
+    return core_providers.suggest_execution_providers()
 
 
 def suggest_execution_threads() -> int:
-    if 'DmlExecutionProvider' in roop.config.globals.execution_providers:
-        return 1
-    if 'ROCMExecutionProvider' in roop.config.globals.execution_providers:
-        return 1
-    return 8
+    return core_resources.suggest_execution_threads()
 
 
 def limit_resources() -> None:
-    # limit memory usage
-    if roop.config.globals.max_memory:
-        memory = roop.config.globals.max_memory * 1024 ** 3
-        if platform.system().lower() == 'darwin':
-            memory = roop.config.globals.max_memory * 1024 ** 6
-        if platform.system().lower() == 'windows':
-            import ctypes
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
-        else:
-            import resource
-            resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
-
-
+    return core_resources.limit_resources()
 
 def release_resources() -> None:
-    import gc
-    from roop.face import release_face_analyser
     global process_mgr
-
-    release_face_analyser()
-    if process_mgr is not None:
-        process_mgr.release_resources()
-        process_mgr = None
-
-    gc.collect()
-    if torch is not None:
-        try:
-            if torch.cuda.is_available():
-                with torch.cuda.device(roop.config.globals.cuda_device_id):
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-        except Exception:
-            pass
+    core_resources.release_resources(process_mgr)
+    process_mgr = None
 
 
 def pre_check() -> bool:

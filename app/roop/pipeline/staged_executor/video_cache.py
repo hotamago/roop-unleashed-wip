@@ -1,18 +1,21 @@
-﻿import json
+import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from roop.pipeline.staged_executor.executor import normalize_cache_image
+
+def normalize_cache_image(image):
+    return np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
 
 
 class VideoStageCache:
     """
-    Compatibility-oriented stage cache with random-access reads.
+    Stage-cache backend with random-access reads.
 
-    The on-disk layout matches the planned `*.mp4` + `*.idx.bin` naming, while
-    storing PNG-compressed frames for deterministic, dependency-light tests.
+    The file layout follows the planned `.mp4` + `.idx.bin` contract while using
+    PNG-compressed payloads internally for deterministic behavior and lightweight
+    dependencies in local tests.
     """
 
     def __init__(self, image_format=".png"):
@@ -20,7 +23,7 @@ class VideoStageCache:
 
     def _resolve_paths(self, cache_path):
         base_path = Path(cache_path)
-        if base_path.suffix.lower() == ".idx.bin":
+        if str(base_path).lower().endswith(".idx.bin"):
             index_path = base_path
             video_path = base_path.with_suffix("").with_suffix(".mp4")
         elif base_path.suffix.lower() == ".mp4":
@@ -87,5 +90,4 @@ class VideoStageCache:
         return selected
 
 
-__all__ = ["VideoStageCache"]
-
+__all__ = ["VideoStageCache", "normalize_cache_image"]

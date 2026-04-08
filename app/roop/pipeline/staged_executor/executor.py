@@ -23,6 +23,15 @@ from roop.media.ffmpeg_writer import FFMPEG_VideoWriter
 from roop.memory import describe_memory_plan, resolve_memory_plan
 from roop.progress.status import get_processing_status_line, publish_processing_progress, set_memory_status
 from roop.media.video_io import open_video_capture, resolve_video_writer_config
+from roop.pipeline.staged_executor import cache as cache_lib
+from roop.pipeline.staged_executor import chunk_processor as chunk_processor_lib
+from roop.pipeline.staged_executor import compose_stage as compose_stage_lib
+from roop.pipeline.staged_executor import detect_stage as detect_stage_lib
+from roop.pipeline.staged_executor import enhance_stage as enhance_stage_lib
+from roop.pipeline.staged_executor import mask_stage as mask_stage_lib
+from roop.pipeline.staged_executor import progress as progress_lib
+from roop.pipeline.staged_executor import swap_stage as swap_stage_lib
+from roop.pipeline.staged_executor import video_iter as video_iter_lib
 
 try:
     from roop.media.stream_writer import StreamWriter
@@ -1614,4 +1623,84 @@ class StagedBatchExecutor:
         # Preserve on-disk stage cache across runs. Users can clear it manually
         # from Settings when they want to reclaim disk space.
         return
+
+
+get_jobs_root = cache_lib.get_jobs_root
+make_json_safe = cache_lib.make_json_safe
+json_dumps = cache_lib.json_dumps
+write_json = cache_lib.write_json
+read_json = cache_lib.read_json
+write_cache_blob = cache_lib.write_cache_blob
+read_cache_blob = cache_lib.read_cache_blob
+normalize_cache_image = cache_lib.normalize_cache_image
+write_image = cache_lib.write_image
+chunked = cache_lib.chunked
+hash_numpy = cache_lib.hash_numpy
+hash_facesets = cache_lib.hash_facesets
+hash_target_faces = cache_lib.hash_target_faces
+PIPELINE_VERSION = cache_lib.PIPELINE_VERSION
+DETECT_PACK_FRAME_COUNT = cache_lib.DETECT_PACK_FRAME_COUNT
+get_entry_file_identity = cache_lib.get_entry_file_identity
+get_staged_cache_options_snapshot = cache_lib.get_staged_cache_options_snapshot
+sanitize_job_path_segment = cache_lib.sanitize_job_path_segment
+get_entry_job_relpath = cache_lib.get_entry_job_relpath
+get_entry_job_key = cache_lib.get_entry_job_key
+get_staged_cache_manifest_signature = cache_lib.get_staged_cache_manifest_signature
+get_entry_signature = cache_lib.get_entry_signature
+list_stage_images = cache_lib.list_stage_images
+merge_stage_defaults = cache_lib.merge_stage_defaults
+iter_video_chunk = video_iter_lib.iter_video_chunk
+
+StagedBatchExecutor.get_pipeline_steps = progress_lib.get_pipeline_steps
+StagedBatchExecutor.get_stage_step_info = progress_lib.get_stage_step_info
+StagedBatchExecutor.update_progress = progress_lib.update_progress
+
+StagedBatchExecutor.get_detect_pack_dir = detect_stage_lib.get_detect_pack_dir
+StagedBatchExecutor.get_detect_pack_frame_count = detect_stage_lib.get_detect_pack_frame_count
+StagedBatchExecutor.get_detect_pack_path = detect_stage_lib.get_detect_pack_path
+StagedBatchExecutor.iter_detect_pack_ranges = detect_stage_lib.iter_detect_pack_ranges
+StagedBatchExecutor.iter_detect_packs = detect_stage_lib.iter_detect_packs
+StagedBatchExecutor.iter_detect_frame_meta = detect_stage_lib.iter_detect_frame_meta
+StagedBatchExecutor.iter_detect_tasks = detect_stage_lib.iter_detect_tasks
+StagedBatchExecutor.flatten_pack_tasks = detect_stage_lib.flatten_pack_tasks
+StagedBatchExecutor.summarize_detect_cache = detect_stage_lib.summarize_detect_cache
+StagedBatchExecutor.iter_full_source_frames_with_meta = detect_stage_lib.iter_full_source_frames_with_meta
+StagedBatchExecutor.ensure_full_detect_stage = detect_stage_lib.ensure_full_detect_stage
+StagedBatchExecutor.ensure_detect_cache = detect_stage_lib.ensure_detect_cache
+StagedBatchExecutor.ensure_chunk_detect = detect_stage_lib.ensure_chunk_detect
+
+StagedBatchExecutor.get_stage_cache_path = cache_lib.get_stage_cache_path
+StagedBatchExecutor.get_stage_pack_path = cache_lib.get_stage_pack_path
+StagedBatchExecutor.read_stage_cache_map = cache_lib.read_stage_cache_map
+StagedBatchExecutor.write_stage_cache_map = cache_lib.write_stage_cache_map
+StagedBatchExecutor.count_stage_cache_entries = cache_lib.count_stage_cache_entries
+StagedBatchExecutor.prepare_job = cache_lib.prepare_job
+StagedBatchExecutor.cleanup_job_dir = cache_lib.cleanup_job_dir
+
+StagedBatchExecutor.flatten_tasks = chunk_processor_lib.flatten_tasks
+StagedBatchExecutor.iter_chunk_source_frames_with_meta = chunk_processor_lib.iter_chunk_source_frames_with_meta
+
+StagedBatchExecutor.get_swap_task_batch_size = swap_stage_lib.get_swap_task_batch_size
+StagedBatchExecutor.ensure_full_swap_stage = swap_stage_lib.ensure_full_swap_stage
+StagedBatchExecutor.ensure_swap_stage = swap_stage_lib.ensure_swap_stage
+
+StagedBatchExecutor.run_mask_single_outputs = mask_stage_lib.run_mask_single_outputs
+StagedBatchExecutor.disable_broken_mask_batch = mask_stage_lib.disable_broken_mask_batch
+StagedBatchExecutor.validate_mask_batch_outputs = mask_stage_lib.validate_mask_batch_outputs
+StagedBatchExecutor.process_full_mask_batch = mask_stage_lib.process_full_mask_batch
+StagedBatchExecutor.ensure_full_mask_stage = mask_stage_lib.ensure_full_mask_stage
+StagedBatchExecutor.ensure_mask_stage = mask_stage_lib.ensure_mask_stage
+
+StagedBatchExecutor.get_enhance_task_batch_size = enhance_stage_lib.get_enhance_task_batch_size
+StagedBatchExecutor.process_full_enhance_batch = enhance_stage_lib.process_full_enhance_batch
+StagedBatchExecutor.ensure_full_enhance_stage = enhance_stage_lib.ensure_full_enhance_stage
+StagedBatchExecutor.ensure_enhance_stage = enhance_stage_lib.ensure_enhance_stage
+
+StagedBatchExecutor.get_compose_worker_count = compose_stage_lib.get_compose_worker_count
+StagedBatchExecutor.compose_frame_from_cache = compose_stage_lib.compose_frame_from_cache
+StagedBatchExecutor.ensure_full_compose_stage = compose_stage_lib.ensure_full_compose_stage
+StagedBatchExecutor.ensure_full_encode_stage = compose_stage_lib.ensure_full_encode_stage
+StagedBatchExecutor.compose_image_from_cache = compose_stage_lib.compose_image_from_cache
+StagedBatchExecutor.compose_chunk = compose_stage_lib.compose_chunk
+StagedBatchExecutor.should_skip_completed_output = compose_stage_lib.should_skip_completed_output
 

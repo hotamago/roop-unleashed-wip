@@ -1,4 +1,4 @@
-# Big Refactor: Professional Project Structure & Pipeline Optimization
+﻿# Big Refactor: Professional Project Structure & Pipeline Optimization
 
 ## User Requirements
 

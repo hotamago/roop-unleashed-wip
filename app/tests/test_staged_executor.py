@@ -93,7 +93,7 @@ def test_ensure_enhance_stage_flushes_cache_once_per_chunk(tmp_path, monkeypatch
         assert path == enhance_cache_path
         write_calls.append(dict(cache_map))
 
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.ProcessMgr", FakeProcessMgr)
+    monkeypatch.setattr("roop.pipeline.staged_executor.enhance_stage.ProcessMgr", FakeProcessMgr)
     monkeypatch.setattr(executor, "read_stage_cache_map", fake_read_stage_cache_map)
     monkeypatch.setattr(executor, "write_stage_cache_map", fake_write_stage_cache_map)
     monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
@@ -221,10 +221,10 @@ def test_ensure_full_compose_stage_streams_source_once_across_packs(tmp_path, mo
         for frame_number in range(frame_start, frame_end):
             yield frame_number, np.zeros((2, 2, 3), dtype=np.uint8)
 
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.open_video_capture", lambda _path: FakeCapture())
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.FFMPEG_VideoWriter", FakeWriter)
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.ProcessMgr", FakeProcessMgr)
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.iter_video_chunk", fake_iter_video_chunk)
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.open_video_capture", lambda _path: FakeCapture())
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.FFMPEG_VideoWriter", FakeWriter)
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.ProcessMgr", FakeProcessMgr)
+    monkeypatch.setattr("roop.pipeline.staged_executor.video_iter.iter_video_chunk", fake_iter_video_chunk)
     monkeypatch.setattr(executor, "iter_detect_packs", fake_iter_detect_packs)
     monkeypatch.setattr(executor, "read_stage_cache_map", lambda _path: {})
     monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
@@ -309,10 +309,10 @@ def test_ensure_full_compose_stage_writes_cached_swapped_frames(tmp_path, monkey
         for frame_number in range(frame_start, frame_end):
             yield frame_number, original_frame.copy()
 
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.open_video_capture", lambda _path: FakeCapture())
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.FFMPEG_VideoWriter", FakeWriter)
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.ProcessMgr", FakeProcessMgr)
-    monkeypatch.setattr("roop.pipeline.staged_executor.executor.iter_video_chunk", fake_iter_video_chunk)
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.open_video_capture", lambda _path: FakeCapture())
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.FFMPEG_VideoWriter", FakeWriter)
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.ProcessMgr", FakeProcessMgr)
+    monkeypatch.setattr("roop.pipeline.staged_executor.video_iter.iter_video_chunk", fake_iter_video_chunk)
     monkeypatch.setattr(executor, "iter_detect_packs", fake_iter_detect_packs)
     monkeypatch.setattr(
         executor,
