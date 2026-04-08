@@ -7,8 +7,10 @@ import numpy as np
 import roop.config.globals
 
 from roop.media.ffmpeg_writer import FFMPEG_VideoWriter
-from roop.media.video_io import ffmpeg_supports_encoder, open_video_capture
-from roop.memory import provider_uses_gpu
+from roop.media.video_io import open_video_capture, resolve_video_writer_config
+
+
+_CACHE_COMPATIBLE_CODECS = {"libx264", "libx265", "h264_nvenc", "hevc_nvenc"}
 
 
 def normalize_cache_image(image):
@@ -49,38 +51,48 @@ class VideoStageCache:
         self.fps = max(1, int(fps))
         self.output_pix_fmt = output_pix_fmt
 
-    def _resolve_writer_config(self):
-        if self.codec not in (None, "", "auto"):
-            return {
-                "codec": self.codec,
-                "quality_args": ["-crf", str(self.crf)],
-                "ffmpeg_params": ["-preset", self.preset, "-g", "1", "-bf", "0"],
-                "allow_fallback": False,
-            }
-        if provider_uses_gpu() and ffmpeg_supports_encoder("h264_nvenc"):
-            return {
-                "codec": "h264_nvenc",
-                "quality_args": ["-cq", "0"],
-                "ffmpeg_params": [
-                    "-rc",
-                    "vbr",
-                    "-b:v",
-                    "0",
-                    "-preset",
-                    "p1",
-                    "-gpu",
-                    str(roop.config.globals.cuda_device_id),
-                    "-g",
-                    "1",
-                    "-bf",
-                    "0",
-                ],
-                "allow_fallback": True,
-            }
+    def _cpu_fallback_config(self):
         return {
             "codec": "libx264",
             "quality_args": ["-crf", "0"],
             "ffmpeg_params": ["-preset", "ultrafast", "-g", "1", "-bf", "0"],
+            "allow_fallback": False,
+        }
+
+    def _resolve_requested_codec(self):
+        if self.codec not in (None, "", "auto"):
+            return self.codec, False
+
+        configured_codec = (
+            getattr(roop.config.globals, "video_encoder", None)
+            or getattr(getattr(roop.config.globals, "CFG", None), "output_video_codec", None)
+            or "libx264"
+        )
+        if configured_codec not in _CACHE_COMPATIBLE_CODECS:
+            configured_codec = "libx264"
+        return configured_codec, True
+
+    def _resolve_writer_config(self):
+        requested_codec, auto_selected = self._resolve_requested_codec()
+        writer_config = resolve_video_writer_config(requested_codec, self.crf)
+        resolved_codec = writer_config["codec"]
+        quality_args = list(writer_config["quality_args"])
+        ffmpeg_params = list(writer_config["ffmpeg_params"])
+
+        if resolved_codec in {"h264_nvenc", "hevc_nvenc"}:
+            ffmpeg_params.extend(["-g", "1", "-bf", "0"])
+            return {
+                "codec": resolved_codec,
+                "quality_args": quality_args,
+                "ffmpeg_params": ffmpeg_params,
+                "allow_fallback": bool(auto_selected),
+            }
+
+        ffmpeg_params.extend(["-preset", self.preset, "-g", "1", "-bf", "0"])
+        return {
+            "codec": resolved_codec,
+            "quality_args": quality_args,
+            "ffmpeg_params": ffmpeg_params,
             "allow_fallback": False,
         }
 
@@ -203,18 +215,17 @@ class VideoStageCache:
             video_path.unlink(missing_ok=True)
             return
         writer_config = self._resolve_writer_config()
-        self._write_video_with_config(video_path, frames, writer_config)
+        try:
+            self._write_video_with_config(video_path, frames, writer_config)
+        except OSError:
+            if not writer_config.get("allow_fallback"):
+                raise
+            video_path.unlink(missing_ok=True)
+            self._write_video_with_config(video_path, frames, self._cpu_fallback_config())
+            return
         if writer_config.get("allow_fallback") and not self._video_is_decodable(video_path):
             video_path.unlink(missing_ok=True)
-            self._write_video_with_config(
-                video_path,
-                frames,
-                {
-                    "codec": "libx264",
-                    "quality_args": ["-crf", "0"],
-                    "ffmpeg_params": ["-preset", "ultrafast", "-g", "1", "-bf", "0"],
-                },
-            )
+            self._write_video_with_config(video_path, frames, self._cpu_fallback_config())
 
     def _read_video_frame(self, capture, frame_idx):
         if frame_idx > 0:

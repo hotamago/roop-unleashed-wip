@@ -2,6 +2,7 @@ import shutil
 
 import numpy as np
 import pytest
+import roop.config.globals
 
 from roop.pipeline.staged_executor.cache import read_cache_blob, read_stage_cache_map, write_cache_blob
 from roop.pipeline.staged_executor.video_cache import VideoStageCache
@@ -81,3 +82,41 @@ def test_legacy_pickle_blob_payload_is_still_readable_before_migration(tmp_path)
     payload = read_cache_blob(cache_path)
 
     assert set(payload["images"]) == {"face_x"}
+
+
+def test_video_stage_cache_auto_codec_respects_global_video_encoder(monkeypatch):
+    cache = VideoStageCache(codec="auto", crf=0, preset="veryfast")
+
+    monkeypatch.setattr(roop.config.globals, "video_encoder", "libx264", raising=False)
+
+    config = cache._resolve_writer_config()
+
+    assert config["codec"] == "libx264"
+    assert config["quality_args"] == ["-crf", "0"]
+    assert config["ffmpeg_params"] == ["-preset", "veryfast", "-g", "1", "-bf", "0"]
+    assert config["allow_fallback"] is False
+
+
+def test_video_stage_cache_auto_gpu_fallback_retries_with_cpu(monkeypatch, tmp_path):
+    cache = VideoStageCache(codec="auto", crf=0, preset="veryfast")
+    cache_path = tmp_path / "swap" / "cache.bin"
+    frames = [_make_image(1)]
+    attempts = []
+
+    monkeypatch.setattr(roop.config.globals, "video_encoder", "h264_nvenc", raising=False)
+
+    def fake_write(video_path, _frames, writer_config):
+        attempts.append(writer_config["codec"])
+        if writer_config["codec"] == "h264_nvenc":
+            raise OSError("nvenc unavailable")
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        video_path.write_bytes(b"ok")
+
+    monkeypatch.setattr(cache, "_write_video_with_config", fake_write)
+    monkeypatch.setattr(cache, "_video_is_decodable", lambda _path: True)
+
+    video_path, _index_path = cache._resolve_paths(cache_path)
+    cache._write_video(video_path, frames)
+
+    assert attempts == ["h264_nvenc", "libx264"]
+    assert video_path.exists()

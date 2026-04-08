@@ -8,10 +8,6 @@ from roop.memory import provider_uses_gpu
 
 
 _FFMPEG_SUPPORT_CACHE = {}
-_CPU_TO_GPU_VIDEO_ENCODERS = {
-    "libx264": "h264_nvenc",
-    "libx265": "hevc_nvenc",
-}
 _GPU_VIDEO_ENCODERS = {"h264_nvenc", "hevc_nvenc"}
 
 
@@ -83,11 +79,6 @@ def open_video_capture(video_path: str):
 
 def resolve_video_writer_config(codec: str, quality: int) -> dict:
     resolved_codec = codec
-    if provider_uses_gpu():
-        promoted_codec = _CPU_TO_GPU_VIDEO_ENCODERS.get(codec)
-        if promoted_codec is not None and ffmpeg_supports_encoder(promoted_codec):
-            resolved_codec = promoted_codec
-
     quality_args = ["-crf", str(quality)]
     ffmpeg_params = []
     if resolved_codec in _GPU_VIDEO_ENCODERS and ffmpeg_supports_encoder(resolved_codec):
