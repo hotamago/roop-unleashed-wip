@@ -58,6 +58,14 @@ class FakeDynamic256Session(FakeSession):
         ]
 
 
+class FakeSingle256Session(FakeSession):
+    def get_inputs(self):
+        return [
+            FakeInputMeta([1, 3, 256, 256], name="target"),
+            FakeInputMeta([1, 512], name="source"),
+        ]
+
+
 class FakeReversedDynamic256Session(FakeSession):
     def get_inputs(self):
         return [
@@ -108,6 +116,56 @@ def test_faceswap_insightface_falls_back_to_single_batch_when_ort_rejects_batch(
     assert processor.model_swap_insightface.calls == [2, 1, 1]
 
 
+def test_faceswap_insightface_falls_back_to_single_batch_when_hyperswap_conv_batch_fails():
+    processor = FaceSwapInsightFace()
+    processor.model_swap_insightface = FakeSession(fail_on_batch_over_one=False)
+    processor.model_swap_insightface.run = lambda _, inputs: (_ for _ in ()).throw(
+        RuntimeError(
+            "[ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running Conv node. "
+            "Name:'/model/generator/generator/pixel_shuffle_up_sample/sequences/sequences.0/Conv' "
+            "Status Message: Input channels C is not equal to kernel channels * group. "
+            "C: 2048 kernel channels: 512 group: 1"
+        )
+    )
+    processor.active_model_key = "hyperswap_1a_256"
+    processor.emap = None
+    processor.batch_size_limit = None
+    processor.supports_batch = True
+
+    source_faces = [make_source_face(), make_source_face()]
+    target_faces = [None, None]
+    temp_frames = [
+        np.ones((1, 3, 256, 256), dtype=np.float32),
+        np.ones((1, 3, 256, 256), dtype=np.float32) * 2,
+    ]
+
+    single_session = FakeSingle256Session()
+    processor.model_swap_insightface = single_session
+    failing_session = FakeDynamic256Session()
+
+    def run_with_failure(_, inputs):
+        target = inputs["target"]
+        failing_session.calls.append(target.shape[0])
+        if target.shape[0] > 1:
+            raise RuntimeError(
+                "[ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running Conv node. "
+                "Name:'/model/generator/generator/pixel_shuffle_up_sample/sequences/sequences.0/Conv' "
+                "Status Message: Input channels C is not equal to kernel channels * group. "
+                "C: 2048 kernel channels: 512 group: 1"
+            )
+        return [target.copy()]
+
+    failing_session.run = run_with_failure
+    processor.model_swap_insightface = failing_session
+
+    outputs = processor.RunBatch(source_faces, target_faces, temp_frames, batch_size=8)
+
+    assert len(outputs) == 2
+    assert processor.batch_size_limit == 1
+    assert processor.supports_batch is False
+    assert failing_session.calls == [2, 1, 1]
+
+
 def test_faceswap_insightface_initialize_uses_native_batch_model(monkeypatch):
     captured = {}
     fake_graph = SimpleNamespace(
@@ -155,16 +213,18 @@ def test_faceswap_insightface_initialize_uses_selected_face_swap_model(monkeypat
 
     def fake_inference_session(model_path, *_args, **_kwargs):
         captured["model_path"] = model_path
-        return FakeDynamic256Session()
+        return FakeSingle256Session()
 
     monkeypatch.setattr("roop.processors.FaceSwapInsightFace.create_inference_session", fake_inference_session)
 
     processor = FaceSwapInsightFace()
     processor.Initialize({"devicename": "cuda", "face_swap_model": "hyperswap_1c_256"})
 
-    assert captured["model_path"] == "hyperswap_1c_256.onnx.patched"
+    assert captured["model_path"] == "hyperswap_1c_256.onnx"
     assert processor.active_model_key == "hyperswap_1c_256"
     assert processor.model_input_size == 256
+    assert processor.batch_size_limit == 1
+    assert processor.supports_batch is False
 
 
 def test_faceswap_insightface_initialize_skips_projection_for_hyperswap_style_models(monkeypatch):

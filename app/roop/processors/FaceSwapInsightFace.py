@@ -88,7 +88,10 @@ class FaceSwapInsightFace(BaseProcessor):
             selected_model_type = get_face_swap_model_type(selected_model)
             graph = onnx.load(original_model_path).graph
             self.emap = self._resolve_projection_matrix(graph, selected_model_type)
-            model_path = resolve_model_path_for_processor(original_model_path, self.processorname)
+            if selected_model_type == "inswapper":
+                model_path = resolve_model_path_for_processor(original_model_path, self.processorname)
+            else:
+                model_path = original_model_path
             self.devicename = self.plugin_options["devicename"].replace("mps", "cpu")
             self.active_model_key = selected_model
             self.model_swap_insightface = create_inference_session(model_path, self.processorname)
@@ -198,7 +201,11 @@ class FaceSwapInsightFace(BaseProcessor):
                     },
                 )[0]
             except Exception as exc:
-                should_disable_batch = batch_count > 1 and "Got invalid dimensions for input: target" in str(exc)
+                error_text = str(exc)
+                should_disable_batch = batch_count > 1 and (
+                    "Got invalid dimensions for input: target" in error_text
+                    or "Input channels C is not equal to kernel channels * group" in error_text
+                )
                 if not should_disable_batch:
                     raise
                 self.batch_size_limit = 1
