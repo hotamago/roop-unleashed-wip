@@ -199,3 +199,57 @@ def test_faceswap_insightface_initialize_skips_projection_for_hyperswap_style_mo
     assert processor.target_input_name == "target"
     assert processor.output_name == "output"
     assert latent.shape == (1, 512)
+
+
+def test_faceswap_insightface_ignores_non_projection_512x512_weights_for_hyperswap(monkeypatch):
+    fake_graph = SimpleNamespace(
+        initializer=[
+            onnx.numpy_helper.from_array(np.ones((512, 512), dtype=np.float32), name="generator.weight"),
+            onnx.numpy_helper.from_array(np.ones((64,), dtype=np.float32), name="other"),
+        ]
+    )
+
+    monkeypatch.setattr("roop.processors.FaceSwapInsightFace.ensure_face_swap_model_downloaded", lambda model: f"{model}.onnx")
+    monkeypatch.setattr("roop.processors.FaceSwapInsightFace.onnx.load", lambda _path: SimpleNamespace(graph=fake_graph))
+    monkeypatch.setattr(
+        "roop.processors.FaceSwapInsightFace.resolve_model_path_for_processor",
+        lambda model_path, _processor_name: model_path,
+    )
+    monkeypatch.setattr(
+        "roop.processors.FaceSwapInsightFace.create_inference_session",
+        lambda *_args, **_kwargs: FakeReversedDynamic256Session(),
+    )
+
+    processor = FaceSwapInsightFace()
+    processor.Initialize({"devicename": "cuda", "face_swap_model": "hyperswap_1a_256"})
+
+    latent = processor._project_source_latent(make_source_face())
+
+    assert processor.emap is None
+    assert np.allclose(latent, np.ones((1, 512), dtype=np.float32))
+
+
+def test_faceswap_insightface_prefers_named_projection_matrix_for_inswapper(monkeypatch):
+    expected_emap = np.eye(512, dtype=np.float32)
+    fake_graph = SimpleNamespace(
+        initializer=[
+            onnx.numpy_helper.from_array(np.ones((512, 512), dtype=np.float32), name="generator.weight"),
+            onnx.numpy_helper.from_array(expected_emap, name="buff2fs"),
+        ]
+    )
+
+    monkeypatch.setattr("roop.processors.FaceSwapInsightFace.ensure_face_swap_model_downloaded", lambda model: f"{model}.onnx")
+    monkeypatch.setattr("roop.processors.FaceSwapInsightFace.onnx.load", lambda _path: SimpleNamespace(graph=fake_graph))
+    monkeypatch.setattr(
+        "roop.processors.FaceSwapInsightFace.resolve_model_path_for_processor",
+        lambda model_path, _processor_name: model_path,
+    )
+    monkeypatch.setattr(
+        "roop.processors.FaceSwapInsightFace.create_inference_session",
+        lambda *_args, **_kwargs: FakeDynamicSession(),
+    )
+
+    processor = FaceSwapInsightFace()
+    processor.Initialize({"devicename": "cuda", "face_swap_model": "inswapper_128"})
+
+    assert np.array_equal(processor.emap, expected_emap)

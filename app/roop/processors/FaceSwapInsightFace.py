@@ -26,11 +26,28 @@ class FaceSwapInsightFace(BaseProcessor):
     batch_size_limit = None
     supports_parallel_single_batch = True
 
-    def _resolve_projection_matrix(self, graph):
+    def _resolve_projection_matrix(self, graph, model_type: str):
+        if model_type != "inswapper":
+            return None
+
+        preferred_names = {"buff2fs", "initializer"}
+        matching_initializers = []
         for initializer in graph.initializer:
             dims = tuple(int(dim) for dim in initializer.dims)
-            if dims == (512, 512):
+            if dims != (512, 512):
+                continue
+            matching_initializers.append(initializer)
+            if initializer.name in preferred_names:
                 return onnx.numpy_helper.to_array(initializer)
+
+        if graph.initializer:
+            last_initializer = graph.initializer[-1]
+            last_dims = tuple(int(dim) for dim in last_initializer.dims)
+            if last_dims == (512, 512):
+                return onnx.numpy_helper.to_array(last_initializer)
+
+        if len(matching_initializers) == 1:
+            return onnx.numpy_helper.to_array(matching_initializers[0])
         return None
 
     def _resolve_selected_model_key(self, plugin_options: dict | None = None) -> str:
@@ -68,8 +85,9 @@ class FaceSwapInsightFace(BaseProcessor):
         self.plugin_options = plugin_options
         if self.model_swap_insightface is None:
             original_model_path = ensure_face_swap_model_downloaded(selected_model)
+            selected_model_type = get_face_swap_model_type(selected_model)
             graph = onnx.load(original_model_path).graph
-            self.emap = self._resolve_projection_matrix(graph)
+            self.emap = self._resolve_projection_matrix(graph, selected_model_type)
             model_path = resolve_model_path_for_processor(original_model_path, self.processorname)
             self.devicename = self.plugin_options["devicename"].replace("mps", "cpu")
             self.active_model_key = selected_model

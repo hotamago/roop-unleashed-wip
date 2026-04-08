@@ -14,7 +14,7 @@ from roop.utils.cache_paths import get_jobs_root as get_persistent_jobs_root
 from .video_cache import VideoStageCache, normalize_cache_image
 
 
-PIPELINE_VERSION = 10
+PIPELINE_VERSION = 11
 DETECT_PACK_FRAME_COUNT = 256
 _STAGE_CACHE = VideoStageCache()
 
