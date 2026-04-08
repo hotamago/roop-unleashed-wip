@@ -1,3 +1,6 @@
+import numpy as np
+
+
 class BaseProcessor:
     plugin_options = None
     batch_size_limit = None
@@ -38,3 +41,22 @@ class BaseProcessor:
         if hasattr(worker, "Initialize"):
             worker.Initialize(dict(self.plugin_options or {}))
         return worker
+
+    def _get_batch_buffer(self, name: str, shape, dtype=np.float32):
+        shape = tuple(int(dim) for dim in shape)
+        dtype = np.dtype(dtype)
+        batch_buffers = getattr(self, "_batch_buffers", None)
+        if batch_buffers is None:
+            batch_buffers = {}
+            self._batch_buffers = batch_buffers
+        buffer_key = (name, shape, dtype.str)
+        batch_buffer = batch_buffers.get(buffer_key)
+        if batch_buffer is None:
+            batch_buffer = np.empty(shape, dtype=dtype)
+            batch_buffers[buffer_key] = batch_buffer
+        return batch_buffer
+
+    def _clear_batch_buffers(self):
+        batch_buffers = getattr(self, "_batch_buffers", None)
+        if isinstance(batch_buffers, dict):
+            batch_buffers.clear()

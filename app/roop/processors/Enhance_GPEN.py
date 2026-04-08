@@ -1,10 +1,10 @@
 ﻿from typing import Any, List, Callable
 import cv2 
 import numpy as np
-import onnxruntime
 import roop.config.globals
 
-from roop.onnx.runtime import get_execution_providers_for_processor, resolve_model_path_for_processor
+from roop.onnx.runtime import resolve_model_path_for_processor
+from roop.onnx.session import create_inference_session
 from roop.processors.base import BaseProcessor
 from roop.config.types import Face, Frame, FaceSet
 from roop.utils import resolve_relative_path
@@ -32,15 +32,15 @@ class Enhance_GPEN(BaseProcessor):
         self.plugin_options = plugin_options
         if self.model_gpen is None:
             model_path = resolve_model_path_for_processor(resolve_relative_path('../models/GPEN-BFR-512.onnx'), self.processorname)
-            self.model_gpen = onnxruntime.InferenceSession(
-                model_path,
-                None,
-                providers=get_execution_providers_for_processor(self.processorname),
-            )
+            self.model_gpen = create_inference_session(model_path, self.processorname)
             # replace Mac mps with cpu for the moment
             self.devicename = self.plugin_options["devicename"].replace('mps', 'cpu')
+            self.model_inputs = self.model_gpen.get_inputs()
+            self.model_outputs = self.model_gpen.get_outputs()
+            self.input_name = self.model_inputs[0].name
+            self.output_name = self.model_outputs[0].name
 
-        self.name = self.model_gpen.get_inputs()[0].name
+        self.name = getattr(self, "input_name", self.model_gpen.get_inputs()[0].name)
         self.batch_size_limit = self._resolve_batch_size_limit()
         self.supports_batch = self.batch_size_limit is None or self.batch_size_limit > 1
 
@@ -90,12 +90,13 @@ class Enhance_GPEN(BaseProcessor):
     def Run(self, source_faceset: FaceSet, target_face: Face, temp_frame: Frame) -> Frame:
         # preprocess
         input_size = temp_frame.shape[1]
-        temp_frame = self._preprocess_frame(temp_frame)
-        temp_frame = np.expand_dims(temp_frame, axis=0).transpose(0, 3, 1, 2)
+        batch_input = self._get_batch_buffer("gpen_input_single", (1, 3, 512, 512), np.float32)
+        batch_input[0] = self._preprocess_frame(temp_frame).transpose(2, 0, 1)
+        temp_frame = np.ascontiguousarray(batch_input[:1])
 
         io_binding = self.model_gpen.io_binding()           
-        io_binding.bind_cpu_input("input", temp_frame)
-        io_binding.bind_output("output", self.devicename)
+        io_binding.bind_cpu_input(getattr(self, "input_name", "input"), temp_frame)
+        io_binding.bind_output(getattr(self, "output_name", "output"), self.devicename)
         self.model_gpen.run_with_iobinding(io_binding)
         ort_outs = io_binding.copy_outputs_to_cpu()
         result = ort_outs[0][0]
@@ -110,15 +111,17 @@ class Enhance_GPEN(BaseProcessor):
         outputs = []
         effective_batch_size = self._effective_batch_size(batch_size)
         for batch_start in range(0, len(temp_frames), effective_batch_size):
-            batch = []
-            for temp_frame in temp_frames[batch_start:batch_start + effective_batch_size]:
-                temp_frame = self._preprocess_frame(temp_frame)
-                batch.append(temp_frame.transpose(2, 0, 1))
-            batch_input = np.stack(batch, axis=0).astype(np.float32)
+            current_frames = temp_frames[batch_start:batch_start + effective_batch_size]
+            if not current_frames:
+                continue
+            batch_input = self._get_batch_buffer("gpen_input", (effective_batch_size, 3, 512, 512), np.float32)
+            for index, temp_frame in enumerate(current_frames):
+                batch_input[index] = self._preprocess_frame(temp_frame).transpose(2, 0, 1)
+            active_batch = np.ascontiguousarray(batch_input[: len(current_frames)])
             try:
-                batch_outputs = self.model_gpen.run(None, {"input": batch_input})[0]
+                batch_outputs = self.model_gpen.run(None, {getattr(self, "input_name", "input"): active_batch})[0]
             except Exception as exc:
-                should_disable_batch = batch_input.shape[0] > 1 and "Got invalid dimensions for input" in str(exc)
+                should_disable_batch = len(current_frames) > 1 and "Got invalid dimensions for input" in str(exc)
                 if not should_disable_batch:
                     raise
                 self.batch_size_limit = 1
@@ -132,4 +135,5 @@ class Enhance_GPEN(BaseProcessor):
     def Release(self):
         del self.model_gpen
         self.model_gpen = None
+        self._clear_batch_buffers()
 

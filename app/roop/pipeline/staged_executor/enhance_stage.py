@@ -17,7 +17,7 @@ def get_enhance_task_batch_size(executor, memory_plan):
 def process_full_enhance_batch(
     executor,
     task_batch,
-    input_cache,
+    input_cache_path,
     output_cache,
     output_cache_path,
     enhance_mgr,
@@ -27,6 +27,7 @@ def process_full_enhance_batch(
     memory_plan,
     flush_cache=True,
 ):
+    input_cache = executor.read_stage_cache_keys(input_cache_path, [task_meta["cache_key"] for task_meta in task_batch])
     current_frames = [np.ascontiguousarray(input_cache[task_meta["cache_key"]]) for task_meta in task_batch]
     enhanced_frames = enhance_mgr.run_enhance_tasks_batch(task_batch, current_frames, processor, memory_plan["enhance_batch_size"])
     for task_meta in task_batch:
@@ -60,7 +61,7 @@ def ensure_full_enhance_stage(executor, detect_dir, swap_dir, mask_dir, enhance_
             pack_tasks = flatten_pack_tasks(executor, pack_data)
             if not pack_tasks:
                 continue
-            input_cache = executor.read_stage_cache_map(executor.get_stage_pack_path(mask_dir if executor.mask_name else swap_dir, pack_data["start_sequence"], pack_data["end_sequence"]))
+            input_cache_path = executor.get_stage_pack_path(mask_dir if executor.mask_name else swap_dir, pack_data["start_sequence"], pack_data["end_sequence"])
             pack_cache_path = executor.get_stage_pack_path(enhance_dir, pack_data["start_sequence"], pack_data["end_sequence"])
             pack_cache = executor.read_stage_cache_map(pack_cache_path)
             if len(pack_cache) >= len(pack_tasks):
@@ -79,7 +80,7 @@ def ensure_full_enhance_stage(executor, detect_dir, swap_dir, mask_dir, enhance_
                     process_full_enhance_batch(
                         executor,
                         task_batch,
-                        input_cache,
+                        input_cache_path,
                         pack_cache,
                         pack_cache_path,
                         enhance_mgr,
@@ -96,7 +97,7 @@ def ensure_full_enhance_stage(executor, detect_dir, swap_dir, mask_dir, enhance_
                 process_full_enhance_batch(
                     executor,
                     task_batch,
-                    input_cache,
+                    input_cache_path,
                     pack_cache,
                     pack_cache_path,
                     enhance_mgr,
@@ -130,7 +131,7 @@ def ensure_enhance_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_pl
         if total_tasks > 0:
             executor.update_progress("enhance", detail="Reusing enhance cache", step_completed=total_tasks, step_total=total_tasks, step_unit="faces")
         return
-    input_cache = executor.read_stage_cache_map(executor.get_stage_cache_path(chunk_dir / ("mask" if executor.mask_name else "swap")))
+    input_cache_path = executor.get_stage_cache_path(chunk_dir / ("mask" if executor.mask_name else "swap"))
     enhance_dir.mkdir(parents=True, exist_ok=True)
     enhance_mgr = ProcessMgr(None)
     enhance_mgr.initialize(roop.config.globals.INPUT_FACESETS, roop.config.globals.TARGET_FACES, executor.build_stage_options([executor.enhancer_name]))
@@ -145,8 +146,9 @@ def ensure_enhance_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_pl
                 processed_tasks += len(batch)
                 executor.update_progress("enhance", detail="Reusing packed enhance cache", step_completed=processed_tasks, step_total=total_tasks, step_unit="faces")
                 continue
-            current_frames = [np.ascontiguousarray(input_cache[task_meta["cache_key"]]) for _, task_meta in pending]
             task_batch = [task_meta for _, task_meta in pending]
+            input_cache = executor.read_stage_cache_keys(input_cache_path, [task_meta["cache_key"] for task_meta in task_batch])
+            current_frames = [np.ascontiguousarray(input_cache[task_meta["cache_key"]]) for task_meta in task_batch]
             enhanced_frames = enhance_mgr.run_enhance_tasks_batch(task_batch, current_frames, processor, memory_plan["enhance_batch_size"])
             for task_meta in task_batch:
                 enhance_cache[task_meta["cache_key"]] = normalize_cache_image(enhanced_frames[task_meta["cache_key"]])

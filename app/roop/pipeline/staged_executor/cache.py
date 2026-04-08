@@ -249,6 +249,38 @@ def read_stage_cache_map(cache_path_or_executor, cache_path: Path | None = None)
     return normalized
 
 
+def read_stage_cache_keys(cache_path_or_executor, cache_path: Path | None = None, keys=None):
+    if keys is None:
+        cache_path, keys = cache_path_or_executor, cache_path
+    cache_path = Path(cache_path)
+    requested_keys = [str(key) for key in (keys or [])]
+    if not requested_keys:
+        return {}
+    if _has_video_stage_cache(cache_path):
+        return _STAGE_CACHE.read_keys(cache_path, requested_keys)
+    legacy_cache = read_stage_cache_map(cache_path)
+    return {
+        cache_key: legacy_cache[cache_key]
+        for cache_key in requested_keys
+        if cache_key in legacy_cache
+    }
+
+
+def list_stage_cache_keys(cache_path_or_executor, cache_path: Path | None = None):
+    if cache_path is None:
+        cache_path = cache_path_or_executor
+    cache_path = Path(cache_path)
+    if _has_video_stage_cache(cache_path):
+        return _STAGE_CACHE.list_keys(cache_path)
+    if not cache_path.exists():
+        return []
+    payload = read_cache_blob(cache_path)
+    images = payload.get("images", {})
+    if not isinstance(images, dict):
+        return []
+    return sorted(str(key) for key in images)
+
+
 def write_stage_cache_map(cache_path_or_executor, cache_path: Path | None = None, cache_map=None):
     if cache_map is None:
         cache_path, cache_map = cache_path_or_executor, cache_path
@@ -260,7 +292,16 @@ def write_stage_cache_map(cache_path_or_executor, cache_path: Path | None = None
 def count_stage_cache_entries(cache_path_or_executor, cache_path: Path | None = None):
     if cache_path is None:
         cache_path = cache_path_or_executor
-    return len(read_stage_cache_map(cache_path))
+    cache_path = Path(cache_path)
+    if _has_video_stage_cache(cache_path):
+        return _STAGE_CACHE.count(cache_path)
+    if not cache_path.exists():
+        return 0
+    payload = read_cache_blob(cache_path)
+    images = payload.get("images", {})
+    if not isinstance(images, dict):
+        return 0
+    return len(images)
 
 
 def prepare_job(executor, entry, memory_plan):
@@ -333,7 +374,9 @@ __all__ = [
     "prepare_job",
     "read_cache_blob",
     "read_json",
+    "read_stage_cache_keys",
     "read_stage_cache_map",
+    "list_stage_cache_keys",
     "sanitize_job_path_segment",
     "write_cache_blob",
     "write_image",

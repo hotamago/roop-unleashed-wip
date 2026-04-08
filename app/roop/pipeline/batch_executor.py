@@ -109,6 +109,16 @@ class ProcessMgr():
         return None
 
 
+    def resolve_face_analysis_modules(self):
+        modules = ["landmark_3d_68", "landmark_2d_106", "detection"]
+        swap_mode = getattr(self.options, "swap_mode", None)
+        if swap_mode == "selected":
+            modules.append("recognition")
+        if swap_mode == "all_female" or swap_mode == "all_male":
+            modules.append("genderage")
+        return modules
+
+
     def initialize(self, input_faces, target_faces, options):
         self.release_single_batch_worker_pools()
         self.input_face_datas = input_faces
@@ -118,9 +128,7 @@ class ProcessMgr():
         self.options = options
         devicename = get_device()
 
-        roop.config.globals.g_desired_face_analysis = ["landmark_3d_68", "landmark_2d_106", "detection", "recognition"]
-        if options.swap_mode == "all_female" or options.swap_mode == "all_male":
-            roop.config.globals.g_desired_face_analysis.append("genderage")
+        roop.config.globals.g_desired_face_analysis = self.resolve_face_analysis_modules()
 
         for p in self.processors:
             newp = next((x for x in options.processors.keys() if x == p.processorname), None)

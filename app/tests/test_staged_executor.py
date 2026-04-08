@@ -83,11 +83,13 @@ def test_ensure_enhance_stage_flushes_cache_once_per_chunk(tmp_path, monkeypatch
             return None
 
     def fake_read_stage_cache_map(path):
-        if path == swap_cache_path:
-            return dict(input_cache)
         if path == enhance_cache_path:
             return {}
         raise AssertionError(path)
+
+    def fake_read_stage_cache_keys(path, keys):
+        assert path == swap_cache_path
+        return {key: input_cache[key] for key in keys}
 
     def fake_write_stage_cache_map(path, cache_map):
         assert path == enhance_cache_path
@@ -95,6 +97,7 @@ def test_ensure_enhance_stage_flushes_cache_once_per_chunk(tmp_path, monkeypatch
 
     monkeypatch.setattr("roop.pipeline.staged_executor.enhance_stage.ProcessMgr", FakeProcessMgr)
     monkeypatch.setattr(executor, "read_stage_cache_map", fake_read_stage_cache_map)
+    monkeypatch.setattr(executor, "read_stage_cache_keys", fake_read_stage_cache_keys)
     monkeypatch.setattr(executor, "write_stage_cache_map", fake_write_stage_cache_map)
     monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
 
@@ -131,12 +134,17 @@ def test_process_full_mask_batch_falls_back_when_batch_masks_are_broken(tmp_path
             ]
 
     monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        executor,
+        "read_stage_cache_keys",
+        lambda _path, keys: {key: input_cache[key] for key in keys},
+    )
 
     processor = FakeBrokenMaskProcessor()
     executor.process_full_mask_batch(
         task_batch,
         original_batch,
-        input_cache,
+        tmp_path / "swap.bin",
         output_cache,
         tmp_path / "mask.bin",
         None,

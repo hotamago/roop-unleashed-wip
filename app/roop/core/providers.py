@@ -14,7 +14,15 @@ def encode_execution_providers(execution_providers: List[str]) -> List[str]:
 
 def _build_cuda_execution_provider():
     torch.cuda.set_device(roop.config.globals.cuda_device_id)
-    return ("CUDAExecutionProvider", {"device_id": roop.config.globals.cuda_device_id})
+    return (
+        "CUDAExecutionProvider",
+        {
+            "device_id": roop.config.globals.cuda_device_id,
+            "arena_extend_strategy": "kNextPowerOfTwo",
+            "cudnn_conv_use_max_workspace": "1",
+            "do_copy_in_default_stream": "1",
+        },
+    )
 
 
 def _supports_tensorrt_fp16() -> bool:

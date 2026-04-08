@@ -194,6 +194,19 @@ class VideoStageCache:
             return {}
         return self.read_keys(cache_path, list(items))
 
+    def list_keys(self, cache_path):
+        _video_path, index_path = self._resolve_paths(cache_path)
+        index = self._read_index(index_path)
+        return sorted(index.get("items", {}))
+
+    def count(self, cache_path):
+        _video_path, index_path = self._resolve_paths(cache_path)
+        index = self._read_index(index_path)
+        count = index.get("count")
+        if isinstance(count, int):
+            return max(0, count)
+        return len(index.get("items", {}))
+
     def read_keys(self, cache_path, keys):
         video_path, index_path = self._resolve_paths(cache_path)
         index = self._read_index(index_path)

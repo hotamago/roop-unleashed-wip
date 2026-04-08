@@ -2,9 +2,9 @@
 import cv2
 import numpy as np
 import onnx
-import onnxruntime
 
-from roop.onnx.runtime import get_execution_providers_for_processor, resolve_model_path_for_processor
+from roop.onnx.runtime import resolve_model_path_for_processor
+from roop.onnx.session import create_inference_session
 from roop.processors.base import BaseProcessor
 from roop.config.types import Face, Frame
 from roop.utils import resolve_relative_path
@@ -37,14 +37,12 @@ class FaceSwapInsightFace(BaseProcessor):
             self.devicename = self.plugin_options["devicename"].replace('mps', 'cpu')
             self.input_mean = 0.0
             self.input_std = 255.0
-            #cuda_options = {"arena_extend_strategy": "kSameAsRequested", 'cudnn_conv_algo_search': 'DEFAULT'}            
-            sess_options = onnxruntime.SessionOptions()
-            sess_options.enable_cpu_mem_arena = False
-            self.model_swap_insightface = onnxruntime.InferenceSession(
-                model_path,
-                sess_options,
-                providers=get_execution_providers_for_processor(self.processorname),
-            )
+            self.model_swap_insightface = create_inference_session(model_path, self.processorname)
+            self.model_inputs = self.model_swap_insightface.get_inputs()
+            self.model_outputs = self.model_swap_insightface.get_outputs()
+            self.target_input_name = self.model_inputs[0].name
+            self.source_input_name = self.model_inputs[1].name
+            self.output_name = self.model_outputs[0].name
             self.batch_size_limit = self._resolve_batch_size_limit()
             self.supports_batch = self.batch_size_limit is None or self.batch_size_limit > 1
         self.source_latent_cache = {}
@@ -93,11 +91,12 @@ class FaceSwapInsightFace(BaseProcessor):
 
 
     def Run(self, source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-        latent = self._project_source_latent(source_face)
+        latent = np.ascontiguousarray(self._project_source_latent(source_face), dtype=np.float32)
+        temp_frame = np.ascontiguousarray(temp_frame, dtype=np.float32)
         io_binding = self.model_swap_insightface.io_binding()           
-        io_binding.bind_cpu_input("target", temp_frame)
-        io_binding.bind_cpu_input("source", latent)
-        io_binding.bind_output("output", self.devicename)
+        io_binding.bind_cpu_input(getattr(self, "target_input_name", "target"), temp_frame)
+        io_binding.bind_cpu_input(getattr(self, "source_input_name", "source"), latent)
+        io_binding.bind_output(getattr(self, "output_name", "output"), self.devicename)
         self.model_swap_insightface.run_with_iobinding(io_binding)
         ort_outs = io_binding.copy_outputs_to_cpu()[0]
         return ort_outs[0]
@@ -108,15 +107,28 @@ class FaceSwapInsightFace(BaseProcessor):
         effective_batch_size = self._effective_batch_size(batch_size)
         for batch_start in range(0, len(temp_frames), effective_batch_size):
             batch_end = batch_start + effective_batch_size
-            batch_frames = np.concatenate(temp_frames[batch_start:batch_end], axis=0).astype(np.float32)
-            latents = []
-            for source_face in source_faces[batch_start:batch_end]:
-                latents.append(self._project_source_latent(source_face))
-            batch_latents = np.concatenate(latents, axis=0)
+            current_frames = temp_frames[batch_start:batch_end]
+            current_faces = source_faces[batch_start:batch_end]
+            if not current_frames:
+                continue
+            batch_count = len(current_frames)
+            frame_shape = tuple(current_frames[0].shape[1:])
+            batch_frames = self._get_batch_buffer("swap_target", (effective_batch_size, *frame_shape), np.float32)
+            latent_width = int(self._project_source_latent(current_faces[0]).shape[-1])
+            batch_latents = self._get_batch_buffer("swap_source", (effective_batch_size, latent_width), np.float32)
+            for index, (temp_frame, source_face) in enumerate(zip(current_frames, current_faces)):
+                batch_frames[index] = np.ascontiguousarray(temp_frame[0], dtype=np.float32)
+                batch_latents[index] = self._project_source_latent(source_face)[0]
             try:
-                batch_outputs = self.model_swap_insightface.run(None, {"target": batch_frames, "source": batch_latents})[0]
+                batch_outputs = self.model_swap_insightface.run(
+                    None,
+                    {
+                        getattr(self, "target_input_name", "target"): np.ascontiguousarray(batch_frames[:batch_count]),
+                        getattr(self, "source_input_name", "source"): np.ascontiguousarray(batch_latents[:batch_count]),
+                    },
+                )[0]
             except Exception as exc:
-                should_disable_batch = batch_frames.shape[0] > 1 and "Got invalid dimensions for input: target" in str(exc)
+                should_disable_batch = batch_count > 1 and "Got invalid dimensions for input: target" in str(exc)
                 if not should_disable_batch:
                     raise
                 self.batch_size_limit = 1
@@ -130,6 +142,7 @@ class FaceSwapInsightFace(BaseProcessor):
         del self.model_swap_insightface
         self.model_swap_insightface = None
         self.source_latent_cache = None
+        self._clear_batch_buffers()
 
 
                 

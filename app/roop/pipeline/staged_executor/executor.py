@@ -1671,6 +1671,8 @@ StagedBatchExecutor.ensure_chunk_detect = detect_stage_lib.ensure_chunk_detect
 
 StagedBatchExecutor.get_stage_cache_path = cache_lib.get_stage_cache_path
 StagedBatchExecutor.get_stage_pack_path = cache_lib.get_stage_pack_path
+StagedBatchExecutor.list_stage_cache_keys = cache_lib.list_stage_cache_keys
+StagedBatchExecutor.read_stage_cache_keys = cache_lib.read_stage_cache_keys
 StagedBatchExecutor.read_stage_cache_map = cache_lib.read_stage_cache_map
 StagedBatchExecutor.write_stage_cache_map = cache_lib.write_stage_cache_map
 StagedBatchExecutor.count_stage_cache_entries = cache_lib.count_stage_cache_entries

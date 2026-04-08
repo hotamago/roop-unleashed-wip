@@ -7,8 +7,14 @@ from roop.processors.FaceSwapInsightFace import FaceSwapInsightFace
 
 
 class FakeInputMeta:
-    def __init__(self, shape):
+    def __init__(self, shape, name="input"):
         self.shape = shape
+        self.name = name
+
+
+class FakeOutputMeta:
+    def __init__(self, name="output"):
+        self.name = name
 
 
 class FakeSession:
@@ -18,9 +24,12 @@ class FakeSession:
 
     def get_inputs(self):
         return [
-            FakeInputMeta([1, 3, 128, 128]),
-            FakeInputMeta([1, 512]),
+            FakeInputMeta([1, 3, 128, 128], name="target"),
+            FakeInputMeta([1, 512], name="source"),
         ]
+
+    def get_outputs(self):
+        return [FakeOutputMeta(name="output")]
 
     def run(self, _, inputs):
         target = inputs["target"]
@@ -36,8 +45,8 @@ class FakeSession:
 class FakeDynamicSession(FakeSession):
     def get_inputs(self):
         return [
-            FakeInputMeta(["batch", 3, 128, 128]),
-            FakeInputMeta(["batch", 512]),
+            FakeInputMeta(["batch", 3, 128, 128], name="target"),
+            FakeInputMeta(["batch", 512], name="source"),
         ]
 
 
@@ -97,7 +106,7 @@ def test_faceswap_insightface_initialize_uses_native_batch_model(monkeypatch):
         captured["model_path"] = model_path
         return FakeDynamicSession()
 
-    monkeypatch.setattr("roop.processors.FaceSwapInsightFace.onnxruntime.InferenceSession", fake_inference_session)
+    monkeypatch.setattr("roop.processors.FaceSwapInsightFace.create_inference_session", fake_inference_session)
 
     processor = FaceSwapInsightFace()
     processor.Initialize({"devicename": "cuda"})

@@ -56,7 +56,7 @@ def process_full_mask_batch(
     executor,
     task_batch,
     original_batch,
-    input_cache,
+    input_cache_path,
     output_cache,
     output_cache_path,
     mask_mgr,
@@ -66,6 +66,7 @@ def process_full_mask_batch(
     memory_plan,
     flush_cache=True,
 ):
+    input_cache = executor.read_stage_cache_keys(input_cache_path, [task_meta["cache_key"] for task_meta in task_batch])
     if getattr(processor, "supports_batch", False):
         batch_inputs = [np.ascontiguousarray(original) for original in original_batch]
         masks = processor.RunBatch(batch_inputs, executor.options.masking_text, memory_plan["mask_batch_size"])
@@ -119,7 +120,7 @@ def ensure_full_mask_stage(executor, entry, endframe, detect_dir, swap_dir, mask
             pack_tasks = flatten_pack_tasks(executor, pack_data)
             if not pack_tasks:
                 continue
-            input_cache = executor.read_stage_cache_map(executor.get_stage_pack_path(swap_dir, pack_data["start_sequence"], pack_data["end_sequence"]))
+            input_cache_path = executor.get_stage_pack_path(swap_dir, pack_data["start_sequence"], pack_data["end_sequence"])
             pack_cache_path = executor.get_stage_pack_path(mask_dir, pack_data["start_sequence"], pack_data["end_sequence"])
             pack_cache = executor.read_stage_cache_map(pack_cache_path)
             if len(pack_cache) >= len(pack_tasks):
@@ -150,7 +151,7 @@ def ensure_full_mask_stage(executor, entry, endframe, detect_dir, swap_dir, mask
                             executor,
                             task_batch,
                             original_batch,
-                            input_cache,
+                            input_cache_path,
                             pack_cache,
                             pack_cache_path,
                             mask_mgr,
@@ -169,7 +170,7 @@ def ensure_full_mask_stage(executor, entry, endframe, detect_dir, swap_dir, mask
                     executor,
                     task_batch,
                     original_batch,
-                    input_cache,
+                    input_cache_path,
                     pack_cache,
                     pack_cache_path,
                     mask_mgr,
@@ -203,7 +204,7 @@ def ensure_mask_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
         if total_tasks > 0:
             executor.update_progress("mask", detail="Reusing mask cache", step_completed=total_tasks, step_total=total_tasks, step_unit="faces")
         return
-    input_cache = executor.read_stage_cache_map(executor.get_stage_cache_path(chunk_dir / "swap"))
+    input_cache_path = executor.get_stage_cache_path(chunk_dir / "swap")
     mask_dir.mkdir(parents=True, exist_ok=True)
     mask_mgr = ProcessMgr(None)
     mask_mgr.initialize(roop.config.globals.INPUT_FACESETS, roop.config.globals.TARGET_FACES, executor.build_stage_options([executor.mask_name]))
@@ -227,7 +228,7 @@ def ensure_mask_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
                         executor,
                         task_batch,
                         original_batch,
-                        input_cache,
+                        input_cache_path,
                         mask_cache,
                         cache_path,
                         mask_mgr,
@@ -246,7 +247,7 @@ def ensure_mask_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
                 executor,
                 task_batch,
                 original_batch,
-                input_cache,
+                input_cache_path,
                 mask_cache,
                 cache_path,
                 mask_mgr,

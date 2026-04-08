@@ -21,6 +21,8 @@ def test_decode_execution_providers_tensorrt_includes_cuda_and_cpu_fallback(monk
     assert providers[0][0] == "TensorrtExecutionProvider"
     assert providers[1][0] == "CUDAExecutionProvider"
     assert providers[-1] == "CPUExecutionProvider"
+    assert providers[1][1]["cudnn_conv_use_max_workspace"] == "1"
+    assert providers[1][1]["do_copy_in_default_stream"] == "1"
 
 
 def test_decode_execution_providers_tensorrt_sets_cache_and_timing_options(monkeypatch, tmp_path):
