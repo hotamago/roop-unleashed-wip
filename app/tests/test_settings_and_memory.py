@@ -20,6 +20,7 @@ from roop.memory.planner import (
 )
 from roop.pipeline.options import ProcessOptions
 from roop.pipeline.staged_executor.cache import get_staged_cache_options_snapshot
+from ui.tabs.settings_tab import on_face_swap_model_changed
 
 
 def test_settings_loads_and_persists_manual_stage_tuning(tmp_path):
@@ -100,6 +101,30 @@ def test_settings_rounds_hyperswap_upscale_to_supported_choice(tmp_path):
 def test_face_swap_model_choices_include_inswapper_fp16():
     assert "inswapper_128_fp16" in get_face_swap_model_choices()
     assert get_face_swap_upscale_choices("inswapper_128_fp16") == ["128px", "256px", "384px", "512px", "768px", "1024px"]
+
+
+def test_on_face_swap_model_changed_downloads_and_releases_runtime(monkeypatch):
+    calls = []
+    monkeypatch.setattr("ui.tabs.settings_tab.ensure_face_swap_model_downloaded", lambda model: calls.append(("download", model)) or f"{model}.onnx")
+    monkeypatch.setattr("ui.tabs.settings_tab.update_memory_status", lambda: "memory-status")
+    monkeypatch.setattr("roop.core.app.release_resources", lambda: calls.append(("release", None)))
+    monkeypatch.setattr(
+        roop.config.globals,
+        "CFG",
+        SimpleNamespace(face_swap_model="hyperswap_1a_256", subsample_upscale="256px"),
+        raising=False,
+    )
+    monkeypatch.setattr(roop.config.globals, "subsample_size", 256, raising=False)
+
+    memory_status, upscale_dropdown, hint = on_face_swap_model_changed("hyperswap_1c_256", "256px")
+
+    assert calls == [("download", "hyperswap_1c_256"), ("release", None)]
+    assert memory_status == "memory-status"
+    assert roop.config.globals.CFG.face_swap_model == "hyperswap_1c_256"
+    assert roop.config.globals.CFG.subsample_upscale == "256px"
+    assert roop.config.globals.subsample_size == 256
+    assert getattr(upscale_dropdown, "value", None) == "256px"
+    assert "hyperswap_1c_256" in getattr(hint, "value", "")
 
 
 def test_face_analytics_model_choices_include_facefusion_variants():

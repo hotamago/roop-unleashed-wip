@@ -15,6 +15,7 @@ from roop.face_analytics_models import (
     get_face_masker_model_key,
 )
 from roop.face_swap_models import (
+    ensure_face_swap_model_downloaded,
     get_face_swap_model_choices,
     get_face_swap_model_hint,
     get_face_swap_model_key,
@@ -54,9 +55,13 @@ def build_face_swap_upscale_update(model_name=None, selected_upscale=None):
 def on_face_swap_model_changed(selected_model, current_upscale):
     model_key = get_face_swap_model_key(selected_model)
     normalized_upscale = normalize_face_swap_upscale(current_upscale, model_key)
+    ensure_face_swap_model_downloaded(model_key)
     roop.config.globals.CFG.face_swap_model = model_key
     roop.config.globals.CFG.subsample_upscale = normalized_upscale
     roop.config.globals.subsample_size = parse_face_swap_upscale_size(normalized_upscale, model_key)
+    from roop.core.app import release_resources
+
+    release_resources()
     return (
         update_memory_status(),
         build_face_swap_upscale_update(model_key, normalized_upscale),
