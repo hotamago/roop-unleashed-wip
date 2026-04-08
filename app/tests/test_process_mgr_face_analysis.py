@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from roop.face.analyser import HybridFaceAnalyser
+from roop.face.analytics_runtime import Fan68From5Landmarker, YoloFaceDetector
 from roop.pipeline.batch_executor import ProcessMgr
 
 
@@ -65,3 +66,67 @@ def test_hybrid_face_analyser_custom_detector_preserves_compatibility_landmarks(
     assert faces[0].landmark_2d_106.shape == (106, 2)
     assert faces[0].landmark_2d_68.shape == (68, 2)
     assert faces[0].kps.shape == (5, 2)
+
+
+def test_yolo_face_detector_keeps_bgr_channel_order(monkeypatch):
+    captured = {}
+
+    class FakeSession:
+        def get_inputs(self):
+            return [SimpleNamespace(name="input")]
+
+        def run(self, _outputs, inputs):
+            captured["input"] = inputs["input"]
+            return [np.zeros((1, 20, 8400), dtype=np.float32)]
+
+    monkeypatch.setattr(
+        "roop.face.analytics_runtime.create_inference_session",
+        lambda *_args, **_kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(
+        "roop.face.analytics_runtime.get_face_detector_model_paths",
+        lambda *_args, **_kwargs: ["fake_yolo.onnx"],
+    )
+
+    detector = YoloFaceDetector("yolo_face", ["CPUExecutionProvider"], (640, 640))
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    frame[0, 0] = np.array([10, 20, 30], dtype=np.uint8)
+
+    detector.detect(frame)
+
+    observed = captured["input"][0, :, 0, 0]
+    assert np.allclose(observed, np.array([10.0, 20.0, 30.0], dtype=np.float32) / 255.0)
+
+
+def test_fan_68_5_landmarker_normalizes_points_before_inference(monkeypatch):
+    captured = {}
+
+    class FakeSession:
+        def get_inputs(self):
+            return [SimpleNamespace(name="input")]
+
+        def run(self, _outputs, inputs):
+            captured["input"] = inputs["input"]
+            return [np.zeros((1, 68, 2), dtype=np.float32)]
+
+    monkeypatch.setattr(
+        "roop.face.analytics_runtime.create_inference_session",
+        lambda *_args, **_kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(
+        "roop.face.analytics_runtime.get_face_landmarker_model_paths",
+        lambda *_args, **_kwargs: ["fake_fan_68_5.onnx"],
+    )
+
+    landmarker = Fan68From5Landmarker("fan_68_5", ["CPUExecutionProvider"])
+    kps = np.array(
+        [[10.0, 10.0], [20.0, 10.0], [15.0, 15.0], [11.0, 20.0], [19.0, 20.0]],
+        dtype=np.float32,
+    )
+
+    landmarker.detect(np.zeros((32, 32, 3), dtype=np.uint8), np.array([8.0, 8.0, 22.0, 22.0], dtype=np.float32), kps)
+
+    normalized_points = captured["input"][0]
+    assert normalized_points.shape == (5, 2)
+    assert np.all(normalized_points >= 0.0)
+    assert np.all(normalized_points <= 1.0)

@@ -13,6 +13,7 @@ import tempfile
 import cv2
 import zipfile
 import traceback
+import numpy as np
 
 from pathlib import Path
 from typing import List, Any
@@ -364,8 +365,24 @@ def create_version_html() -> str:
     return versions_html
 
 
+def _coerce_embedding_vector(embedding):
+    if embedding is None:
+        return None
+    try:
+        vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if vector.size < 1 or not np.isfinite(vector).all():
+        return None
+    return vector
+
+
 def compute_cosine_distance(emb1, emb2) -> float:
-    return distance.cosine(emb1, emb2)
+    vec1 = _coerce_embedding_vector(emb1)
+    vec2 = _coerce_embedding_vector(emb2)
+    if vec1 is None or vec2 is None or vec1.shape != vec2.shape:
+        return 1.0
+    return float(distance.cosine(vec1, vec2))
 
 def has_cuda_device():
     return torch.cuda is not None and torch.cuda.is_available()

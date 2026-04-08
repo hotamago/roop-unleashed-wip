@@ -255,8 +255,7 @@ class YoloFaceDetector(BaseFaceDetector):
         temp_frame = restrict_frame(frame, self.det_size)
         ratio_height = frame.shape[0] / temp_frame.shape[0]
         ratio_width = frame.shape[1] / temp_frame.shape[1]
-        detect_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
-        detect_frame = prepare_detect_frame(detect_frame, self.det_size)
+        detect_frame = prepare_detect_frame(temp_frame, self.det_size)
         detect_frame = normalize_detect_frame(detect_frame, (0, 1))
         detection = self.session.run(None, {self.input_name: detect_frame})[0]
         detection = np.squeeze(detection).T
@@ -315,8 +314,7 @@ class YuNetDetector(BaseFaceDetector):
         temp_frame = restrict_frame(frame, self.det_size)
         ratio_height = frame.shape[0] / temp_frame.shape[0]
         ratio_width = frame.shape[1] / temp_frame.shape[1]
-        detect_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
-        detect_frame = prepare_detect_frame(detect_frame, self.det_size)
+        detect_frame = prepare_detect_frame(temp_frame, self.det_size)
         detection = self.session.run(None, {self.input_name: detect_frame})
 
         bounding_boxes = []
@@ -461,7 +459,8 @@ class Fan68From5Landmarker(BaseFaceLandmarker):
         del frame, bbox
         if kps is None or np.asarray(kps).shape != (5, 2):
             return None, 0.0
-        affine_matrix = estimate_matrix_by_face_landmark_5(np.asarray(kps, dtype=np.float32), (512, 512))
+        # FaceFusion feeds fan_68_5 normalized FFHQ points in the [0, 1] range.
+        affine_matrix = estimate_matrix_by_face_landmark_5(np.asarray(kps, dtype=np.float32), (1, 1))
         face_landmark_5 = cv2.transform(np.asarray(kps, dtype=np.float32).reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
         face_landmark_68 = self.session.run(None, {self.input_name: np.expand_dims(face_landmark_5, axis=0)})[0][0]
         face_landmark_68 = cv2.transform(

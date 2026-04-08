@@ -1,4 +1,5 @@
 import threading
+from contextlib import contextmanager
 from typing import Any
 
 import insightface
@@ -24,6 +25,7 @@ from roop.utils import resolve_relative_path
 FACE_ANALYSER = None
 FACE_ANALYSER_SIGNATURE = None
 THREAD_LOCK_ANALYSER = threading.Lock()
+DEFAULT_FACE_ANALYSIS_MODULES = ["landmark_3d_68", "landmark_2d_106", "detection"]
 
 
 class HybridFaceAnalyser:
@@ -59,11 +61,14 @@ class HybridFaceAnalyser:
                 if task_name == "detection":
                     continue
                 model.get(frame, face)
+            self._normalize_face_vectors(face)
             faces.append(face)
         return self._enrich_faces(frame, faces)
 
     def _enrich_faces(self, frame, faces):
         if self.landmarker is None:
+            for face in faces:
+                self._normalize_face_vectors(face)
             return faces
         for face in faces:
             try:
@@ -73,17 +78,38 @@ class HybridFaceAnalyser:
             except Exception:
                 continue
             if landmark_2d_68 is None:
+                self._normalize_face_vectors(face)
                 continue
             face["landmark_2d_68"] = np.asarray(landmark_2d_68, dtype=np.float32)
             face["landmark_2d_68_score"] = float(landmark_score)
+            self._normalize_face_vectors(face)
         return faces
+
+    @staticmethod
+    def _normalize_face_vectors(face):
+        for key in ("embedding", "normed_embedding"):
+            value = getattr(face, key, None)
+            if value is None:
+                continue
+            try:
+                face[key] = np.asarray(value, dtype=np.float32).reshape(-1)
+            except Exception:
+                continue
 
 
 def _get_allowed_modules() -> list[str]:
     desired = getattr(roop.config.globals, "g_desired_face_analysis", None)
     if desired:
         return list(desired)
-    return ["landmark_3d_68", "landmark_2d_106", "detection"]
+    return list(DEFAULT_FACE_ANALYSIS_MODULES)
+
+
+def build_face_analysis_modules(extra_modules=None) -> list[str]:
+    modules = list(DEFAULT_FACE_ANALYSIS_MODULES)
+    for module in extra_modules or []:
+        if module and module not in modules:
+            modules.append(module)
+    return modules
 
 
 def _build_face_analyser_signature() -> tuple:
@@ -149,4 +175,27 @@ def get_face_analyser() -> Any:
     return FACE_ANALYSER
 
 
-__all__ = ["get_face_analyser", "release_face_analyser"]
+@contextmanager
+def use_face_analysis_modules(extra_modules=None):
+    previous_modules = getattr(roop.config.globals, "g_desired_face_analysis", None)
+    requested_modules = build_face_analysis_modules(extra_modules)
+    previous_signature = tuple(previous_modules) if previous_modules else None
+    requested_signature = tuple(requested_modules)
+
+    if previous_signature != requested_signature:
+        roop.config.globals.g_desired_face_analysis = list(requested_modules)
+        release_face_analyser()
+    try:
+        yield list(requested_modules)
+    finally:
+        if previous_signature != requested_signature:
+            roop.config.globals.g_desired_face_analysis = list(previous_modules) if previous_modules else None
+            release_face_analyser()
+
+
+__all__ = [
+    "build_face_analysis_modules",
+    "get_face_analyser",
+    "release_face_analyser",
+    "use_face_analysis_modules",
+]

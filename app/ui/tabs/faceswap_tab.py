@@ -17,7 +17,7 @@ from roop.face_swap_models import (
     parse_face_swap_upscale_size,
 )
 from roop.utils.cache_paths import get_gradio_temp_root
-from roop.face import extract_face_images, create_blank_image
+from roop.face import extract_face_images, create_blank_image, use_face_analysis_modules
 from roop.media.capturer import get_video_frame, get_video_frame_total, get_image_frame
 from roop.pipeline.entry import ProcessEntry
 from roop.pipeline.options import ProcessOptions
@@ -672,6 +672,11 @@ def clear_target_face_state():
     SELECTED_TARGET_FACE_INDEX = 0
 
 
+def extract_face_images_for_swap(source_path, video_info):
+    with use_face_analysis_modules(["recognition"]):
+        return extract_face_images(source_path, video_info)
+
+
 def append_faceset_source(source_path, source_ref):
     unzipfolder = os.path.join(os.environ["TEMP"], 'faceset')
     if os.path.isdir(unzipfolder):
@@ -683,19 +688,20 @@ def append_faceset_source(source_path, source_ref):
     util.unzip(source_path, unzipfolder)
     is_first = True
     face_set = FaceSet()
-    for filename in os.listdir(unzipfolder):
-        if not filename.endswith(".png"):
-            continue
-        full_path = os.path.join(unzipfolder, filename)
-        selection_faces_data = extract_face_images(full_path, (False, 0))
-        for face_data in selection_faces_data:
-            face = face_data[0]
-            face.mask_offsets = list(default_mask_offsets())
-            face_set.faces.append(face)
-            if is_first:
-                ui.globals.ui_input_thumbs.append(util.convert_to_gradio(face_data[1]))
-                is_first = False
-            face_set.ref_images.append(get_image_frame(full_path))
+    with use_face_analysis_modules(["recognition"]):
+        for filename in os.listdir(unzipfolder):
+            if not filename.endswith(".png"):
+                continue
+            full_path = os.path.join(unzipfolder, filename)
+            selection_faces_data = extract_face_images(full_path, (False, 0))
+            for face_data in selection_faces_data:
+                face = face_data[0]
+                face.mask_offsets = list(default_mask_offsets())
+                face_set.faces.append(face)
+                if is_first:
+                    ui.globals.ui_input_thumbs.append(util.convert_to_gradio(face_data[1]))
+                    is_first = False
+                face_set.ref_images.append(get_image_frame(full_path))
     if len(face_set.faces) < 1:
         raise ValueError(f"No faces found in faceset: {source_path}")
     if len(face_set.faces) > 1:
@@ -706,7 +712,7 @@ def append_faceset_source(source_path, source_ref):
 
 
 def append_image_source(source_path, source_ref):
-    selection_faces_data = extract_face_images(source_path, (False, 0))
+    selection_faces_data = extract_face_images_for_swap(source_path, (False, 0))
     face_index = int(source_ref.get("face_index", 0) or 0)
     if face_index < 0 or face_index >= len(selection_faces_data):
         raise ValueError(f"Source face index {face_index} is out of range for {source_path}")
@@ -753,7 +759,7 @@ def append_target_face_from_resume(face_ref):
     is_video = util.is_video(target_path) or target_path.lower().endswith('gif')
     if is_video and frame_number <= 0:
         frame_number = 1
-    faces_data = extract_face_images(target_path, (is_video, frame_number))
+    faces_data = extract_face_images_for_swap(target_path, (is_video, frame_number))
     face_index = select_target_face_index_from_resume(faces_data, face_ref)
     if face_index < 0 or face_index >= len(faces_data):
         raise ValueError(f"Target face index {face_index} is out of range for {target_path}")
@@ -1349,7 +1355,7 @@ def on_srcfile_changed(srcfiles, progress=gr.Progress()):
         elif util.has_image_extension(source_path):
             progress(0, desc="Retrieving faces from image")      
             roop.config.globals.source_path = source_path
-            selection_faces_data = extract_face_images(roop.config.globals.source_path,  (False, 0))
+            selection_faces_data = extract_face_images_for_swap(roop.config.globals.source_path,  (False, 0))
             progress(0.5, desc="Retrieving faces from image")
             for face_index, face_data in enumerate(selection_faces_data):
                 face_set = FaceSet()
@@ -1373,6 +1379,40 @@ def on_srcfile_changed(srcfiles, progress=gr.Progress()):
             "to consolidate multiple images of the same source into a single faceset file."
         )
     return ui.globals.ui_input_thumbs, None
+
+
+def ensure_loaded_face_embeddings():
+    global SELECTED_INPUT_FACE_INDEX, SELECTED_TARGET_FACE_INDEX
+
+    reload_inputs = any(
+        getattr(face_set, "faces", None) and get_face_embedding_vector(face_set.faces[0]) is None
+        for face_set in roop.config.globals.INPUT_FACESETS
+    )
+    reload_targets = any(
+        get_face_embedding_vector(face) is None
+        for face in roop.config.globals.TARGET_FACES
+    )
+    if not reload_inputs and not reload_targets:
+        return False
+
+    input_refs = [dict(face_ref) for face_ref in ui.globals.ui_input_face_refs]
+    target_refs = [dict(face_ref) for face_ref in ui.globals.ui_target_face_refs]
+    selected_input_index = SELECTED_INPUT_FACE_INDEX
+    selected_target_index = SELECTED_TARGET_FACE_INDEX
+
+    if reload_inputs and input_refs:
+        restore_input_faces_from_resume(input_refs)
+        if roop.config.globals.INPUT_FACESETS:
+            SELECTED_INPUT_FACE_INDEX = max(0, min(selected_input_index, len(roop.config.globals.INPUT_FACESETS) - 1))
+
+    if reload_targets and target_refs:
+        clear_target_face_state()
+        for face_ref in target_refs:
+            append_target_face_from_resume(face_ref)
+        if roop.config.globals.TARGET_FACES:
+            SELECTED_TARGET_FACE_INDEX = max(0, min(selected_target_index, len(roop.config.globals.TARGET_FACES) - 1))
+
+    return True
 
 
 def on_select_input_face(evt: gr.SelectData):
@@ -1468,9 +1508,9 @@ def on_use_face_from_selected(files, frame_num):
     faces_data = []
 
     if util.is_image(roop.config.globals.target_path) and not roop.config.globals.target_path.lower().endswith(('gif')):
-        faces_data = extract_face_images(roop.config.globals.target_path, (False, 0))
+        faces_data = extract_face_images_for_swap(roop.config.globals.target_path, (False, 0))
     elif util.is_video(roop.config.globals.target_path) or roop.config.globals.target_path.lower().endswith(('gif')):
-        faces_data = extract_face_images(roop.config.globals.target_path, (True, frame_num))
+        faces_data = extract_face_images_for_swap(roop.config.globals.target_path, (True, frame_num))
     else:
         gr.Info('Unknown image/video type!')
         roop.config.globals.target_path = None
@@ -1552,6 +1592,7 @@ def on_preview_frame_changed(frame_num, files, fake_preview, enhancer, detection
     mask_engine = map_mask_engine(selected_mask_engine, clip_text)
 
     roop.config.globals.execution_threads = roop.config.globals.CFG.max_threads
+    ensure_loaded_face_embeddings()
     face_index = SELECTED_INPUT_FACE_INDEX
     if len(roop.config.globals.INPUT_FACESETS) <= face_index:
         face_index = 0
@@ -1630,6 +1671,7 @@ def on_preview_mask(frame_num, files, clip_text, mask_engine):
         current_frame = get_image_frame(filename)
     if current_frame is None or mask_engine is None:
         return None
+    ensure_loaded_face_embeddings()
     if mask_engine == "Clip2Seg":
         mask_engine = "mask_clip2seg"
         if clip_text is None or len(clip_text) < 1:
@@ -1773,6 +1815,8 @@ def start_swap( output_method, enhancer, detection, keep_frames, wait_after_extr
             gr.Error('No Target Face selected!')
             yield gr.Button(variant="primary", interactive=True), gr.Button(variant="secondary", interactive=False), get_processing_status_markdown(), resume_status
             return
+
+    ensure_loaded_face_embeddings()
 
     is_processing = True
     start_processing_status("Preparing faceswap job", total_files=len(list_files_process))

@@ -154,6 +154,8 @@ class FaceSwapInsightFace(BaseProcessor):
             source_embedding = getattr(source_face, "normed_embedding", None)
             if source_embedding is None:
                 source_embedding = getattr(source_face, "embedding", None)
+        if source_embedding is None:
+            raise ValueError("Source face is missing a recognition embedding. Re-add the source face so it can be analyzed for swapping.")
 
         latent = np.asarray(source_embedding, dtype=np.float32).reshape((1, -1))
         if self.emap is not None:
