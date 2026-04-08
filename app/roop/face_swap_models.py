@@ -14,7 +14,7 @@ FACE_SWAP_MODEL_SET = {
     },
     "inswapper_128_fp16": {
         "filename": "inswapper_128_fp16.onnx",
-        "url": "https://huggingface.co/uwg/upscaler/resolve/f6bace545e358eab5491f8f39b90a2dd42e8cc77/Face_Restore/FaceFusion/inswapper_128_fp16.onnx",
+        "url": "https://huggingface.co/facefusion/models-3.0.0/resolve/main/inswapper_128_fp16.onnx",
         "tile_size": 128,
         "type": "inswapper",
         "template": "arcface_128",
