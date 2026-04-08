@@ -6,8 +6,9 @@ from roop.pipeline.batch_executor import ProcessMgr
 
 from .chunk_processor import flatten_tasks, iter_chunk_source_frames_with_meta
 from .detect_stage import flatten_pack_tasks
+from .swap_stage import get_swap_source_stage_dir
 from .video_iter import iter_video_chunk
-from .cache import normalize_cache_image, write_json
+from .cache import chunked, normalize_cache_image, write_json
 
 
 def run_mask_single_outputs(executor, processor, original_batch):
@@ -99,6 +100,18 @@ def process_full_mask_batch(
     )
 
 
+def build_source_aligned_batch(source_cache, task_batch):
+    if not source_cache:
+        return None
+    originals = []
+    for task_meta in task_batch:
+        original = source_cache.get(task_meta["cache_key"])
+        if original is None:
+            return None
+        originals.append(np.ascontiguousarray(original))
+    return originals
+
+
 def ensure_full_mask_stage(executor, entry, endframe, detect_dir, swap_dir, mask_dir, task_count, stages, manifest, memory_plan):
     if executor.mask_name is None or task_count <= 0:
         stages["mask"] = True
@@ -125,11 +138,68 @@ def ensure_full_mask_stage(executor, entry, endframe, detect_dir, swap_dir, mask
                 continue
             input_cache_path = executor.get_stage_pack_path(swap_dir, pack_data["start_sequence"], pack_data["end_sequence"])
             input_cache = executor.read_stage_cache_map(input_cache_path)
+            source_cache_path = executor.get_stage_pack_path(
+                get_swap_source_stage_dir(swap_dir),
+                pack_data["start_sequence"],
+                pack_data["end_sequence"],
+            )
+            source_cache = executor.read_stage_cache_map(source_cache_path)
             pack_cache_path = executor.get_stage_pack_path(mask_dir, pack_data["start_sequence"], pack_data["end_sequence"])
             pack_cache = executor.read_stage_cache_map(pack_cache_path)
             if len(pack_cache) >= len(pack_tasks):
                 processed_tasks += len(pack_tasks)
                 executor.update_progress("mask", detail="Reusing packed mask cache", step_completed=processed_tasks, step_total=task_count, step_unit="faces")
+                continue
+
+            if source_cache and len(source_cache) >= len(pack_tasks):
+                task_batch = []
+                original_batch = []
+                pack_cache_dirty = False
+                for _frame_meta, task_meta in pack_tasks:
+                    if task_meta["cache_key"] in pack_cache:
+                        processed_tasks += 1
+                        executor.update_progress("mask", detail="Reusing packed mask cache", step_completed=processed_tasks, step_total=task_count, step_unit="faces")
+                        continue
+                    task_batch.append(dict(task_meta))
+                    original_batch.append(np.ascontiguousarray(source_cache[task_meta["cache_key"]]))
+                    if len(task_batch) >= task_batch_size:
+                        process_full_mask_batch(
+                            executor,
+                            task_batch,
+                            original_batch,
+                            input_cache,
+                            pack_cache,
+                            pack_cache_path,
+                            mask_mgr,
+                            processor,
+                            processed_tasks,
+                            task_count,
+                            memory_plan,
+                            flush_cache=False,
+                        )
+                        pack_cache_dirty = True
+                        processed_tasks += len(task_batch)
+                        task_batch.clear()
+                        original_batch.clear()
+                if task_batch:
+                    process_full_mask_batch(
+                        executor,
+                        task_batch,
+                        original_batch,
+                        input_cache,
+                        pack_cache,
+                        pack_cache_path,
+                        mask_mgr,
+                        processor,
+                        processed_tasks,
+                        task_count,
+                        memory_plan,
+                        flush_cache=False,
+                    )
+                    pack_cache_dirty = True
+                    processed_tasks += len(task_batch)
+                if pack_cache_dirty:
+                    executor.write_stage_cache_map(pack_cache_path, pack_cache)
                 continue
 
             frame_lookup = {frame_meta["frame_number"]: frame_meta for frame_meta in pack_data["frames"]}
@@ -210,6 +280,8 @@ def ensure_mask_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
         return
     input_cache_path = executor.get_stage_cache_path(chunk_dir / "swap")
     input_cache = executor.read_stage_cache_map(input_cache_path)
+    source_cache_path = executor.get_stage_cache_path(get_swap_source_stage_dir(chunk_dir / "swap"))
+    source_cache = executor.read_stage_cache_map(source_cache_path)
     mask_dir.mkdir(parents=True, exist_ok=True)
     mask_mgr = ProcessMgr(None)
     mask_mgr.initialize(roop.config.globals.INPUT_FACESETS, roop.config.globals.TARGET_FACES, executor.build_stage_options([executor.mask_name]))
@@ -220,6 +292,38 @@ def ensure_mask_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
     task_batch_size = max(1, min(128, memory_plan["mask_batch_size"]))
     cache_dirty = False
     try:
+        if source_cache and len(source_cache) >= total_tasks:
+            for task_batch_meta in chunked(flat_tasks, task_batch_size):
+                pending = [dict(task_meta) for _, task_meta in task_batch_meta if task_meta["cache_key"] not in mask_cache]
+                if not pending:
+                    processed_tasks += len(task_batch_meta)
+                    executor.update_progress("mask", detail="Reusing packed masks", step_completed=processed_tasks, step_total=total_tasks, step_unit="faces")
+                    continue
+                original_batch = build_source_aligned_batch(source_cache, pending)
+                if original_batch is None:
+                    break
+                process_full_mask_batch(
+                    executor,
+                    pending,
+                    original_batch,
+                    input_cache,
+                    mask_cache,
+                    cache_path,
+                    mask_mgr,
+                    processor,
+                    processed_tasks,
+                    total_tasks,
+                    memory_plan,
+                    flush_cache=False,
+                )
+                cache_dirty = True
+                processed_tasks += len(task_batch_meta)
+            else:
+                if cache_dirty:
+                    executor.write_stage_cache_map(cache_path, mask_cache)
+                chunk_state["stages"]["mask"] = True
+                return
+
         for _, frame, frame_meta in iter_chunk_source_frames_with_meta(executor, chunk_meta, memory_plan, video_path=video_path, source_image=source_image):
             for task_meta in frame_meta["tasks"]:
                 if task_meta["cache_key"] in mask_cache:
@@ -272,6 +376,7 @@ def ensure_mask_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
 
 
 __all__ = [
+    "build_source_aligned_batch",
     "disable_broken_mask_batch",
     "ensure_full_mask_stage",
     "ensure_mask_stage",

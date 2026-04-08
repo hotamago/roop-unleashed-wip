@@ -195,6 +195,77 @@ def test_process_full_mask_batch_uses_single_batch_worker_pool_for_non_batch_pro
     assert np.array_equal(output_cache["face_b"], normalize_cache_image(input_cache["face_b"] + 1))
 
 
+def test_ensure_full_mask_stage_reuses_swap_source_cache_without_decoding_video(tmp_path, monkeypatch):
+    executor = StagedBatchExecutor("File", None, make_options({"faceswap": {}, "mask_xseg": {}}))
+    entry = ProcessEntry("clip.mp4", 0, 2, 30.0)
+    detect_dir = tmp_path / "detect"
+    swap_dir = tmp_path / "swap"
+    mask_dir = tmp_path / "mask"
+    manifest = {}
+    stages = {"mask": False}
+    memory_plan = {"mask_batch_size": 8}
+    pack_data = {
+        "start_sequence": 1,
+        "end_sequence": 2,
+        "frames": [
+            {"frame_number": 10, "tasks": [{"cache_key": "face_a"}]},
+            {"frame_number": 11, "tasks": [{"cache_key": "face_b"}]},
+        ],
+    }
+    swap_cache_path = executor.get_stage_pack_path(swap_dir, 1, 2)
+    swap_source_cache_path = executor.get_stage_pack_path(swap_dir.parent / "swap_source", 1, 2)
+    mask_cache_path = executor.get_stage_pack_path(mask_dir, 1, 2)
+    write_calls = []
+
+    class FakeMaskProcessor:
+        supports_batch = False
+
+    class FakeProcessMgr:
+        def __init__(self, _progress):
+            self.processors = [FakeMaskProcessor()]
+
+        def initialize(self, *_args, **_kwargs):
+            return None
+
+        def run_mask_tasks_batch(self, task_batch, current_frames, _processor, _batch_size):
+            return {
+                task_meta["cache_key"]: normalize_cache_image(current_frame + 1)
+                for task_meta, current_frame in zip(task_batch, current_frames)
+            }
+
+        def release_resources(self):
+            return None
+
+    def fake_read_stage_cache_map(path):
+        if path == swap_cache_path:
+            return {
+                "face_a": np.full((2, 2, 3), 10, dtype=np.uint8),
+                "face_b": np.full((2, 2, 3), 20, dtype=np.uint8),
+            }
+        if path == swap_source_cache_path:
+            return {
+                "face_a": np.full((2, 2, 3), 30, dtype=np.uint8),
+                "face_b": np.full((2, 2, 3), 40, dtype=np.uint8),
+            }
+        if path == mask_cache_path:
+            return {}
+        raise AssertionError(path)
+
+    monkeypatch.setattr("roop.pipeline.staged_executor.mask_stage.ProcessMgr", FakeProcessMgr)
+    monkeypatch.setattr("roop.pipeline.staged_executor.mask_stage.iter_video_chunk", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("video decode should be skipped")))
+    monkeypatch.setattr(executor, "iter_detect_packs", lambda _detect_dir: [pack_data])
+    monkeypatch.setattr(executor, "read_stage_cache_map", fake_read_stage_cache_map)
+    monkeypatch.setattr(executor, "write_stage_cache_map", lambda path, cache_map: write_calls.append((path, dict(cache_map))))
+    monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
+
+    executor.ensure_full_mask_stage(entry, 12, detect_dir, swap_dir, mask_dir, 2, stages, manifest, memory_plan)
+
+    assert stages["mask"] is True
+    assert len(write_calls) == 1
+    assert write_calls[0][0] == mask_cache_path
+    assert set(write_calls[0][1].keys()) == {"face_a", "face_b"}
+
+
 def test_compose_frame_from_cache_skips_fallback_reprocess_for_original_frame_mode(monkeypatch):
     executor = StagedBatchExecutor("File", None, make_options({"faceswap": {}}))
     frame = np.full((2, 2, 3), 77, dtype=np.uint8)

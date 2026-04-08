@@ -105,6 +105,37 @@ def build_subset_stage_inputs(job_dir: Path, frame_window: int, workspace: Path)
     detect_pack_paths = sorted((job_dir / "detect" / "plans").glob("*.bin"))
     if not detect_pack_paths:
         raise FileNotFoundError(f"No detect pack cache found in {job_dir}")
+    best_candidate = find_dense_window(job_dir, frame_window)
+    if best_candidate is None:
+        raise ValueError("No frame window with cached face tasks was found.")
+
+    selected_frames = best_candidate["pack_frames"][
+        best_candidate["start_index"]:best_candidate["start_index"] + best_candidate["window_size"]
+    ]
+    task_keys = [task["cache_key"] for frame_meta in selected_frames for task in frame_meta.get("tasks", [])]
+    subset_pack = {
+        "start_sequence": int(selected_frames[0]["sequence"]),
+        "end_sequence": int(selected_frames[-1]["sequence"]),
+        "frames": selected_frames,
+    }
+    detect_dir = workspace / "detect"
+    swap_dir = workspace / "swap"
+    detect_dir.mkdir(parents=True, exist_ok=True)
+    swap_dir.mkdir(parents=True, exist_ok=True)
+    write_cache_blob(get_stage_pack_path(detect_dir, subset_pack["start_sequence"], subset_pack["end_sequence"]), subset_pack)
+
+    source_swap_cache_path = job_dir / "swap" / "packs" / best_candidate["source_pack_path"].name
+    subset_swap_cache = read_stage_cache_keys(source_swap_cache_path, task_keys)
+    if not subset_swap_cache:
+        raise ValueError("Selected window has detect tasks but no swap cache entries.")
+    write_stage_cache_map(get_stage_pack_path(swap_dir, subset_pack["start_sequence"], subset_pack["end_sequence"]), subset_swap_cache)
+    return subset_pack, task_keys, detect_dir, swap_dir
+
+
+def find_dense_window(job_dir: Path, frame_window: int):
+    detect_pack_paths = sorted((job_dir / "detect" / "plans").glob("*.bin"))
+    if not detect_pack_paths:
+        raise FileNotFoundError(f"No detect pack cache found in {job_dir}")
     best_candidate = None
     for source_pack_path in detect_pack_paths:
         source_pack = read_cache_blob(source_pack_path)
@@ -130,30 +161,7 @@ def build_subset_stage_inputs(job_dir: Path, frame_window: int, workspace: Path)
                 "source_pack_path": source_pack_path,
             }
 
-    if best_candidate is None:
-        raise ValueError("No frame window with cached face tasks was found.")
-
-    selected_frames = best_candidate["pack_frames"][
-        best_candidate["start_index"]:best_candidate["start_index"] + best_candidate["window_size"]
-    ]
-    task_keys = [task["cache_key"] for frame_meta in selected_frames for task in frame_meta.get("tasks", [])]
-    subset_pack = {
-        "start_sequence": int(selected_frames[0]["sequence"]),
-        "end_sequence": int(selected_frames[-1]["sequence"]),
-        "frames": selected_frames,
-    }
-    detect_dir = workspace / "detect"
-    swap_dir = workspace / "swap"
-    detect_dir.mkdir(parents=True, exist_ok=True)
-    swap_dir.mkdir(parents=True, exist_ok=True)
-    write_cache_blob(get_stage_pack_path(detect_dir, subset_pack["start_sequence"], subset_pack["end_sequence"]), subset_pack)
-
-    source_swap_cache_path = job_dir / "swap" / "packs" / best_candidate["source_pack_path"].name
-    subset_swap_cache = read_stage_cache_keys(source_swap_cache_path, task_keys)
-    if not subset_swap_cache:
-        raise ValueError("Selected window has detect tasks but no swap cache entries.")
-    write_stage_cache_map(get_stage_pack_path(swap_dir, subset_pack["start_sequence"], subset_pack["end_sequence"]), subset_swap_cache)
-    return subset_pack, task_keys, detect_dir, swap_dir
+    return best_candidate
 
 
 def benchmark_mask_stage(entry, settings, memory_plan, workspace, detect_dir, swap_dir, subset_pack):
@@ -201,6 +209,57 @@ def benchmark_direct_encode(entry, memory_plan, output_dir):
     return elapsed, frame_count
 
 
+def benchmark_full_flow(entry, options):
+    import cv2
+
+    cap = cv2.VideoCapture(entry.filename)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    memory_plan = resolve_memory_plan(width, height)
+    executor = StagedBatchExecutor("File", None, options)
+    executor.jobs_root = Path(tempfile.mkdtemp(prefix="fullflow_jobs_", dir=os.environ["TEMP"]))
+    stage_stats = {}
+    original_update = executor.update_progress
+
+    def patched_update(stage, *args, **kwargs):
+        now = time.perf_counter()
+        stats = stage_stats.setdefault(
+            stage,
+            {"first": now, "last": now, "max_step": 0, "unit": kwargs.get("step_unit")},
+        )
+        stats["last"] = now
+        stats["unit"] = kwargs.get("step_unit", stats.get("unit"))
+        step_completed = kwargs.get("step_completed")
+        if isinstance(step_completed, int) and step_completed > stats["max_step"]:
+            stats["max_step"] = step_completed
+        return original_update(stage, *args, **kwargs)
+
+    executor.update_progress = patched_update
+    try:
+        roop.config.globals.processing = True
+        started = time.perf_counter()
+        executor.process_video_entry_full_frames(entry, 0)
+        total_elapsed = time.perf_counter() - started
+    finally:
+        shutil.rmtree(executor.jobs_root, ignore_errors=True)
+
+    results = {"total_elapsed": total_elapsed, "memory_plan": memory_plan}
+    for stage in ("detect", "swap", "mask", "enhance", "composite", "mux"):
+        stats = stage_stats.get(stage)
+        if not stats:
+            continue
+        elapsed = max(stats["last"] - stats["first"], 0.0)
+        completed = stats["max_step"]
+        results[stage] = {
+            "elapsed": elapsed,
+            "completed": completed,
+            "unit": stats.get("unit"),
+            "rate": (completed / elapsed) if elapsed > 0 and completed > 0 else 0.0,
+        }
+    return results
+
+
 def format_rate(units, elapsed, suffix):
     if elapsed <= 0:
         return "n/a"
@@ -211,6 +270,18 @@ def main():
     parser = argparse.ArgumentParser(description="Short staged benchmark using a real resume file.")
     parser.add_argument("--resume", required=True, help="Path to a resume JSON file.")
     parser.add_argument("--frames", type=int, default=64, help="Number of frames to benchmark from the start of the resume clip.")
+    parser.add_argument(
+        "--window",
+        choices=("dense", "start"),
+        default="dense",
+        help="Choose the densest cached frame window or start from the resume clip beginning.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("full-flow", "hot-path"),
+        default="full-flow",
+        help="Benchmark full staged flow or only the isolated pack-cache hot path.",
+    )
     args = parser.parse_args()
 
     app_root = APP_ROOT
@@ -237,8 +308,18 @@ def main():
     )
     if target.get("endframe"):
         entry.endframe = min(int(target.get("endframe")), entry.endframe)
+    entry.finalname = str(app_root / "output" / "benchmark_staged_short.mp4")
 
-    frame_count = max(entry.endframe - entry.startframe, 1)
+    if args.window == "dense":
+        job_dir = find_existing_job_dir(entry)
+        dense_window = find_dense_window(job_dir, args.frames)
+        if dense_window is not None:
+            dense_frames = dense_window["pack_frames"][
+                dense_window["start_index"]:dense_window["start_index"] + dense_window["window_size"]
+            ]
+            entry.startframe = int(dense_frames[0]["frame_number"])
+            entry.endframe = int(dense_frames[-1]["frame_number"]) + 1
+
     import cv2
 
     cap = cv2.VideoCapture(entry.filename)
@@ -247,6 +328,21 @@ def main():
     cap.release()
     memory_plan = resolve_memory_plan(width, height)
     print(f"Memory plan: {describe_memory_plan(memory_plan)}")
+    options = make_options(get_processing_plugins(map_mask_engine(settings["selected_mask_engine"], settings["clip_text"])), settings)
+    frame_count = max(entry.endframe - entry.startframe, 1)
+
+    if args.mode == "full-flow":
+        results = benchmark_full_flow(entry, options)
+        print(f"Resume: {Path(args.resume).resolve()}")
+        print(f"Window: frames {entry.startframe}..{entry.endframe} ({frame_count} frames)")
+        print(f"Mode: full-flow ({args.window} window)")
+        print(f"Total: {results['total_elapsed']:.3f}s")
+        for stage in ("detect", "swap", "mask", "enhance", "composite"):
+            stats = results.get(stage)
+            if not stats:
+                continue
+            print(f"{stage}: {stats['elapsed']:.3f}s | {stats['rate']:.2f} {stats['unit']}/s")
+        return
 
     job_dir = find_existing_job_dir(entry)
     workspace = Path(tempfile.mkdtemp(prefix="staged_short_", dir=os.environ["TEMP"]))
@@ -261,6 +357,7 @@ def main():
 
         print(f"Resume: {Path(args.resume).resolve()}")
         print(f"Window: frames {entry.startframe}..{entry.endframe} ({frame_count} frames)")
+        print(f"Mode: hot-path")
         print(f"Tasks: {len(task_keys)} faces")
         print(f"Mask stage: {mask_elapsed:.3f}s | {format_rate(mask_tasks, mask_elapsed, 'faces')}")
         print(f"Enhance stage: {enhance_elapsed:.3f}s | {format_rate(enhance_tasks, enhance_elapsed, 'faces')}")

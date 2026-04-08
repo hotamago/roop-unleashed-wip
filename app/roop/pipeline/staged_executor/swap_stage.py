@@ -15,6 +15,10 @@ def get_swap_task_batch_size(executor, memory_plan):
     return max(native_batch_window, min(64, worker_window))
 
 
+def get_swap_source_stage_dir(swap_dir):
+    return swap_dir.parent / "swap_source"
+
+
 def ensure_full_swap_stage(executor, entry, endframe, detect_dir, swap_dir, task_count, stages, manifest, memory_plan):
     if not executor.swap_enabled or task_count <= 0:
         stages["swap"] = True
@@ -34,6 +38,9 @@ def ensure_full_swap_stage(executor, entry, endframe, detect_dir, swap_dir, task
     processor = swap_mgr.processors[0]
     processed_tasks = 0
     task_batch_size = get_swap_task_batch_size(executor, memory_plan)
+    source_cache_dir = get_swap_source_stage_dir(swap_dir) if executor.mask_name is not None else None
+    if source_cache_dir is not None:
+        source_cache_dir.mkdir(parents=True, exist_ok=True)
     try:
         for pack_data in executor.iter_detect_packs(detect_dir):
             pack_tasks = flatten_pack_tasks(executor, pack_data)
@@ -41,7 +48,15 @@ def ensure_full_swap_stage(executor, entry, endframe, detect_dir, swap_dir, task
                 continue
             pack_cache_path = executor.get_stage_pack_path(swap_dir, pack_data["start_sequence"], pack_data["end_sequence"])
             pack_cache = executor.read_stage_cache_map(pack_cache_path)
-            if len(pack_cache) >= len(pack_tasks):
+            source_cache_path = (
+                executor.get_stage_pack_path(source_cache_dir, pack_data["start_sequence"], pack_data["end_sequence"])
+                if source_cache_dir is not None
+                else None
+            )
+            source_pack_cache = executor.read_stage_cache_map(source_cache_path) if source_cache_path is not None else None
+            if len(pack_cache) >= len(pack_tasks) and (
+                source_pack_cache is None or len(source_pack_cache) >= len(pack_tasks)
+            ):
                 processed_tasks += len(pack_tasks)
                 executor.update_progress("swap", detail="Reusing packed swap cache", step_completed=processed_tasks, step_total=task_count, step_unit="faces")
                 continue
@@ -66,6 +81,9 @@ def ensure_full_swap_stage(executor, entry, endframe, detect_dir, swap_dir, task
                     task_batch.append(task)
                     if len(task_batch) >= task_batch_size:
                         batch_outputs = swap_mgr.run_swap_tasks_batch(task_batch, processor, memory_plan["swap_batch_size"])
+                        if source_pack_cache is not None:
+                            for task in task_batch:
+                                source_pack_cache[task["cache_key"]] = normalize_cache_image(task["aligned_frame"])
                         for cache_key, fake_frame in batch_outputs.items():
                             pack_cache[cache_key] = normalize_cache_image(fake_frame)
                         pack_cache_dirty = True
@@ -74,6 +92,9 @@ def ensure_full_swap_stage(executor, entry, endframe, detect_dir, swap_dir, task
                         task_batch.clear()
             if task_batch:
                 batch_outputs = swap_mgr.run_swap_tasks_batch(task_batch, processor, memory_plan["swap_batch_size"])
+                if source_pack_cache is not None:
+                    for task in task_batch:
+                        source_pack_cache[task["cache_key"]] = normalize_cache_image(task["aligned_frame"])
                 for cache_key, fake_frame in batch_outputs.items():
                     pack_cache[cache_key] = normalize_cache_image(fake_frame)
                 pack_cache_dirty = True
@@ -81,6 +102,8 @@ def ensure_full_swap_stage(executor, entry, endframe, detect_dir, swap_dir, task
                 executor.update_progress("swap", detail="Streaming source decode + batched face swap", step_completed=processed_tasks, step_total=task_count, step_unit="faces")
             if pack_cache_dirty:
                 executor.write_stage_cache_map(pack_cache_path, pack_cache)
+                if source_cache_path is not None and source_pack_cache is not None:
+                    executor.write_stage_cache_map(source_cache_path, source_pack_cache)
     finally:
         swap_mgr.release_resources()
     stages["swap"] = True
@@ -109,10 +132,17 @@ def ensure_swap_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
     task_batch = []
     task_batch_size = get_swap_task_batch_size(executor, memory_plan)
     cache_dirty = False
+    source_cache_dir = get_swap_source_stage_dir(swap_dir) if executor.mask_name is not None else None
+    source_cache_path = executor.get_stage_cache_path(source_cache_dir) if source_cache_dir is not None else None
+    source_cache = executor.read_stage_cache_map(source_cache_path) if source_cache_path is not None else None
+    if source_cache_dir is not None:
+        source_cache_dir.mkdir(parents=True, exist_ok=True)
     try:
         for _, frame, frame_meta in iter_chunk_source_frames_with_meta(executor, chunk_meta, memory_plan, video_path=video_path, source_image=source_image):
             for task_meta in frame_meta["tasks"]:
-                if task_meta["cache_key"] in swap_cache:
+                if task_meta["cache_key"] in swap_cache and (
+                    source_cache is None or task_meta["cache_key"] in source_cache
+                ):
                     processed_tasks += 1
                     executor.update_progress("swap", detail="Reusing packed swap cache", step_completed=processed_tasks, step_total=total_tasks, step_unit="faces")
                     continue
@@ -121,6 +151,9 @@ def ensure_swap_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
                 task_batch.append(task)
                 if len(task_batch) >= task_batch_size:
                     batch_outputs = swap_mgr.run_swap_tasks_batch(task_batch, processor, memory_plan["swap_batch_size"])
+                    if source_cache is not None:
+                        for prepared_task in task_batch:
+                            source_cache[prepared_task["cache_key"]] = normalize_cache_image(prepared_task["aligned_frame"])
                     for cache_key, fake_frame in batch_outputs.items():
                         swap_cache[cache_key] = normalize_cache_image(fake_frame)
                     cache_dirty = True
@@ -129,6 +162,9 @@ def ensure_swap_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
                     task_batch.clear()
         if task_batch:
             batch_outputs = swap_mgr.run_swap_tasks_batch(task_batch, processor, memory_plan["swap_batch_size"])
+            if source_cache is not None:
+                for prepared_task in task_batch:
+                    source_cache[prepared_task["cache_key"]] = normalize_cache_image(prepared_task["aligned_frame"])
             for cache_key, fake_frame in batch_outputs.items():
                 swap_cache[cache_key] = normalize_cache_image(fake_frame)
             cache_dirty = True
@@ -136,9 +172,11 @@ def ensure_swap_stage(executor, chunk_dir, chunk_meta, chunk_state, memory_plan,
             executor.update_progress("swap", detail="Streaming source decode + batched face swap", step_completed=processed_tasks, step_total=total_tasks, step_unit="faces")
         if cache_dirty:
             executor.write_stage_cache_map(cache_path, swap_cache)
+            if source_cache_path is not None and source_cache is not None:
+                executor.write_stage_cache_map(source_cache_path, source_cache)
     finally:
         swap_mgr.release_resources()
     chunk_state["stages"]["swap"] = True
 
 
-__all__ = ["ensure_full_swap_stage", "ensure_swap_stage", "get_swap_task_batch_size"]
+__all__ = ["ensure_full_swap_stage", "ensure_swap_stage", "get_swap_source_stage_dir", "get_swap_task_batch_size"]
