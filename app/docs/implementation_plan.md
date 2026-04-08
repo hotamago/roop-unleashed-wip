@@ -1,5 +1,12 @@
 # Big Refactor: Professional Project Structure & Pipeline Optimization
 
+## User Requirements
+
+Big refactor, Phân chia, cấu trúc hóa lại các code trong app, hiện tại có nhiều file chứa quá nhiều thứ, tách ra phân chia thư mục, cấu trúc project professional. Thẳng tay xóa những file không dùng hoặc đã bị phân chia. Đảm bảo thư mục gọn gàng
+Đảm bảo rằng project, code dễ scale và phát triển sau này, simplify but effect.
+- optimize từng step process kỹ càng (detect face, step Streaming source decode + mask stage,  step face swap, Optimize step enhancement stage)
+- Tận dụng tối đa tính toán nặng trên GPU, ngoài ra tận dụng tối đa tính toán song song nếu phải dùng CPU
+
 ## Problem Summary
 
 The codebase has several critical structural issues:
