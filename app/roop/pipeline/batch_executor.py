@@ -11,6 +11,7 @@ from roop.utils import compute_cosine_distance, get_device, str_to_class
 from roop.memory import resolve_single_batch_workers
 from roop.face_swap_models import (
     get_face_swap_model_mean,
+    get_face_swap_model_template,
     get_face_swap_model_standard_deviation,
     get_face_swap_model_type,
 )
@@ -152,6 +153,8 @@ class ProcessMgr():
                 p = str_to_class(module, classname)
             if p is not None:
                 extoption.update({"devicename": devicename})
+                if key == "faceswap":
+                    extoption["face_swap_model"] = getattr(options, "face_swap_model", None)
                 p.Initialize(extoption)
                 newprocessors.append(p)
             else:
@@ -280,7 +283,7 @@ class ProcessMgr():
                     working_face = rotface
                     cutout_box = [start_x, start_y, end_x, end_y]
 
-        aligned_img, matrix = align_crop(working_frame, working_face.kps, self.options.subsample_size)
+        aligned_img, matrix = self.align_face_for_swap(working_frame, working_face)
         working_face.matrix = matrix
         mask_offsets = [0, 0, 0, 0, 20.0, 10.0, 1.0, 1.0, 1.0, 1.0]
         if inputface is not None and hasattr(inputface, "mask_offsets"):
@@ -324,6 +327,13 @@ class ProcessMgr():
         return get_face_swap_model_type(model_key)
 
 
+    def get_swap_model_template(self, processor=None):
+        model_key = getattr(self.options, "face_swap_model", None)
+        if processor is not None:
+            model_key = getattr(processor, "active_model_key", model_key)
+        return get_face_swap_model_template(model_key)
+
+
     def get_swap_model_normalization(self, processor=None):
         model_key = getattr(self.options, "face_swap_model", None)
         if processor is not None:
@@ -331,6 +341,42 @@ class ProcessMgr():
         return (
             np.asarray(get_face_swap_model_mean(model_key), dtype=np.float32),
             np.asarray(get_face_swap_model_standard_deviation(model_key), dtype=np.float32),
+        )
+
+
+    @staticmethod
+    def get_face_alignment_landmarks(face):
+        landmarks_68 = getattr(face, "landmark_2d_68", None)
+        if landmarks_68 is not None:
+            landmarks_68 = np.asarray(landmarks_68, dtype=np.float32).reshape(-1, 2)
+            if landmarks_68.shape[0] >= 55:
+                return np.asarray(
+                    [
+                        np.mean(landmarks_68[36:42], axis=0),
+                        np.mean(landmarks_68[42:48], axis=0),
+                        landmarks_68[30],
+                        landmarks_68[48],
+                        landmarks_68[54],
+                    ],
+                    dtype=np.float32,
+                )
+        kps = getattr(face, "kps", None)
+        if kps is not None:
+            kps = np.asarray(kps, dtype=np.float32).reshape(-1, 2)
+            if kps.shape == (5, 2):
+                return kps
+        return None
+
+
+    def align_face_for_swap(self, frame: Frame, face: Face, processor=None):
+        landmarks = self.get_face_alignment_landmarks(face)
+        if landmarks is None:
+            raise ValueError("Target face is missing 5-point landmarks required for swap alignment.")
+        return align_crop(
+            frame,
+            landmarks,
+            self.options.subsample_size,
+            self.get_swap_model_template(processor),
         )
 
 
@@ -347,7 +393,7 @@ class ProcessMgr():
                 working_frame = rotate_clockwise(cutout_frame)
             else:
                 working_frame = cutout_frame
-        aligned_img, _ = align_crop(working_frame, target_face.kps, self.options.subsample_size)
+        aligned_img, _ = self.align_face_for_swap(working_frame, target_face)
         return aligned_img
 
 
@@ -1102,7 +1148,7 @@ class ProcessMgr():
         model_output_size = self.get_swap_model_output_size(swap_processor)
         subsample_size = self.options.subsample_size
         subsample_total = max(subsample_size // model_output_size, 1)
-        aligned_img, M = align_crop(frame, target_face.kps, subsample_size)
+        aligned_img, M = self.align_face_for_swap(frame, target_face, swap_processor)
 
         fake_frame = aligned_img
         target_face.matrix = M

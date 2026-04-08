@@ -96,6 +96,10 @@ def get_face_swap_model_type(model_name=None) -> str:
     return str(get_face_swap_model_config(model_name).get("type") or "inswapper")
 
 
+def get_face_swap_model_template(model_name=None) -> str:
+    return str(get_face_swap_model_config(model_name).get("template") or "arcface_128")
+
+
 def get_face_swap_model_mean(model_name=None) -> list[float]:
     return list(get_face_swap_model_config(model_name).get("mean") or [0.0, 0.0, 0.0])
 

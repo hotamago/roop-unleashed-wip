@@ -43,7 +43,7 @@ def test_process_mgr_staged_plan_matches_legacy_process_frame(monkeypatch):
 
     monkeypatch.setattr("roop.pipeline.batch_executor.get_all_faces", lambda _frame: [detected_face])
     monkeypatch.setattr("roop.pipeline.batch_executor.compute_cosine_distance", lambda _a, _b: 0.0)
-    monkeypatch.setattr("roop.pipeline.batch_executor.align_crop", lambda frame, _kps, _size: (frame.copy(), np.eye(2, 3, dtype=np.float32)))
+    monkeypatch.setattr("roop.pipeline.batch_executor.align_crop", lambda frame, _kps, _size, _mode=None: (frame.copy(), np.eye(2, 3, dtype=np.float32)))
     monkeypatch.setattr(ProcessMgr, "paste_upscale", lambda self, fake_face, _upsk_face, _matrix, _target_img, _scale_factor, _mask_offsets, face_landmarks=None: fake_face)
     monkeypatch.setattr(roop.config.globals, "autorotate_faces", False, raising=False)
     monkeypatch.setattr(roop.config.globals, "vr_mode", False, raising=False)

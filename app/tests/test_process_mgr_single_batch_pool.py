@@ -3,6 +3,7 @@
 import numpy as np
 
 import roop.config.globals
+import roop.pipeline.batch_executor as batch_executor
 from roop.pipeline.batch_executor import ProcessMgr
 
 
@@ -70,6 +71,20 @@ class FakeShortBatchSwapProcessor:
         return [np.ones_like(frames[0][0], dtype=np.float32) * 0.5]
 
 
+class FakeInitCaptureProcessor:
+    processorname = "faceswap"
+    type = "swap"
+
+    def __init__(self):
+        self.initialized_with = None
+
+    def Initialize(self, options):
+        self.initialized_with = dict(options)
+
+    def Release(self):
+        return None
+
+
 def test_process_mgr_parallelizes_single_batch_processors(monkeypatch):
     mgr = ProcessMgr(None)
     mgr.options = SimpleNamespace(num_swap_steps=1, subsample_size=256)
@@ -92,6 +107,70 @@ def test_process_mgr_parallelizes_single_batch_processors(monkeypatch):
     assert set(outputs.keys()) == {"task_a", "task_b", "task_c"}
     assert all(isinstance(value, np.ndarray) for value in outputs.values())
     assert processor.released is False
+
+
+def test_process_mgr_passes_face_swap_model_from_options_into_processor(monkeypatch):
+    mgr = ProcessMgr(None)
+    processor = FakeInitCaptureProcessor()
+    mgr.processors = [processor]
+    mgr.input_face_datas = []
+    mgr.target_face_datas = []
+    options = SimpleNamespace(
+        processors={"faceswap": {}},
+        face_swap_model="hyperswap_1b_256",
+        swap_mode="all",
+        imagemask=None,
+    )
+
+    monkeypatch.setattr("roop.pipeline.batch_executor.get_device", lambda: "cuda")
+
+    mgr.initialize([], [], options)
+
+    assert processor.initialized_with["face_swap_model"] == "hyperswap_1b_256"
+    assert processor.initialized_with["devicename"] == "cuda"
+
+
+def test_process_mgr_aligns_faces_with_model_template_and_refined_landmarks(monkeypatch):
+    mgr = ProcessMgr(None)
+    mgr.options = SimpleNamespace(face_swap_model="hyperswap_1b_256", subsample_size=256)
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+    captured = {}
+    target_face = SimpleNamespace(
+        landmark_2d_68=np.zeros((68, 2), dtype=np.float32),
+        kps=np.array([[1.0, 1.0], [2.0, 1.0], [1.5, 1.5], [1.2, 2.0], [1.8, 2.0]], dtype=np.float32),
+    )
+    target_face.landmark_2d_68[36:42] = np.array([[10.0, 11.0]] * 6, dtype=np.float32)
+    target_face.landmark_2d_68[42:48] = np.array([[20.0, 21.0]] * 6, dtype=np.float32)
+    target_face.landmark_2d_68[30] = np.array([15.0, 16.0], dtype=np.float32)
+    target_face.landmark_2d_68[48] = np.array([12.0, 25.0], dtype=np.float32)
+    target_face.landmark_2d_68[54] = np.array([18.0, 25.0], dtype=np.float32)
+
+    def fake_align_crop(image, landmark, image_size, mode):
+        captured["image_shape"] = image.shape
+        captured["landmark"] = landmark
+        captured["image_size"] = image_size
+        captured["mode"] = mode
+        return np.zeros((image_size, image_size, 3), dtype=np.uint8), np.eye(2, 3, dtype=np.float32)
+
+    monkeypatch.setattr(batch_executor, "align_crop", fake_align_crop)
+
+    mgr.align_face_for_swap(frame, target_face)
+
+    assert captured["mode"] == "arcface_128"
+    assert captured["image_size"] == 256
+    assert np.allclose(
+        captured["landmark"],
+        np.array(
+            [
+                [10.0, 11.0],
+                [20.0, 21.0],
+                [15.0, 16.0],
+                [12.0, 25.0],
+                [18.0, 25.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
 
 
 def test_process_mgr_disables_broken_swap_batch_outputs():

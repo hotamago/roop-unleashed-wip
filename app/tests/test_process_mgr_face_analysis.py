@@ -130,3 +130,32 @@ def test_fan_68_5_landmarker_normalizes_points_before_inference(monkeypatch):
     assert normalized_points.shape == (5, 2)
     assert np.all(normalized_points >= 0.0)
     assert np.all(normalized_points <= 1.0)
+
+
+def test_process_mgr_prefers_refined_landmarks_for_swap_alignment():
+    mgr = ProcessMgr(None)
+    face = SimpleNamespace(
+        landmark_2d_68=np.zeros((68, 2), dtype=np.float32),
+        kps=np.array([[1.0, 1.0], [2.0, 1.0], [1.5, 1.5], [1.2, 2.0], [1.8, 2.0]], dtype=np.float32),
+    )
+    face.landmark_2d_68[36:42] = np.array([[10.0, 11.0]] * 6, dtype=np.float32)
+    face.landmark_2d_68[42:48] = np.array([[20.0, 21.0]] * 6, dtype=np.float32)
+    face.landmark_2d_68[30] = np.array([15.0, 16.0], dtype=np.float32)
+    face.landmark_2d_68[48] = np.array([12.0, 25.0], dtype=np.float32)
+    face.landmark_2d_68[54] = np.array([18.0, 25.0], dtype=np.float32)
+
+    landmarks = mgr.get_face_alignment_landmarks(face)
+
+    assert np.allclose(
+        landmarks,
+        np.array(
+            [
+                [10.0, 11.0],
+                [20.0, 21.0],
+                [15.0, 16.0],
+                [12.0, 25.0],
+                [18.0, 25.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
