@@ -44,6 +44,7 @@ from roop.media.capturer import get_video_frame_total, release_video
 from roop.memory import get_available_vram_gb
 from roop.progress.status import finish_processing_status, set_processing_message
 from roop.pipeline.staged_executor.executor import StagedBatchExecutor
+from roop.pipeline.one_chain_executor import OneChainAllExecutor
 from roop.core import providers as core_providers
 from roop.core import resources as core_resources
 from roop.face_swap_models import ensure_face_swap_model_downloaded, parse_face_swap_upscale_size
@@ -248,6 +249,37 @@ def batch_process_regular(output_method, files:list[ProcessEntry], masking_engin
         process_mgr.initialize(roop.config.globals.INPUT_FACESETS, roop.config.globals.TARGET_FACES, options)
         set_processing_message("Running legacy extract-frames flow", stage="legacy", current_step=1, total_steps=4, detail="Using compatibility pipeline", force_log=True)
         batch_process_legacy(output_method, files, False)
+        return
+    if processing_mode == "One-chain-all":
+        prepare_output_targets(files)
+        if output_method != "File":
+            set_processing_message(
+                "One-chain-all only supports file outputs; falling back to legacy flow",
+                stage="legacy",
+                current_step=1,
+                total_steps=4,
+                detail="Virtual camera streaming still uses the legacy compatibility pipeline",
+                force_log=True,
+            )
+            if process_mgr is None:
+                process_mgr = ProcessMgr(progress)
+            process_mgr.initialize(roop.config.globals.INPUT_FACESETS, roop.config.globals.TARGET_FACES, options)
+            batch_process_legacy(output_method, files, False)
+            return
+        set_processing_message(
+            "Running one-chain-all flow",
+            stage="prepare",
+            current_step=1,
+            total_steps=4,
+            detail="Extract frames, run the full chain per frame, then merge with ffmpeg",
+            force_log=True,
+        )
+        executor = OneChainAllExecutor(output_method, progress, options)
+        executor.run(files)
+        if roop.config.globals.processing:
+            end_processing('Finished')
+        else:
+            end_processing('Processing stopped!')
         return
 
     prepare_output_targets(files)

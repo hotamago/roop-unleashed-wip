@@ -1151,7 +1151,7 @@ def faceswap_tab():
 
         with gr.Row(variant='panel'):
             with gr.Column(scale=1):
-                video_swapping_method = gr.Dropdown(["Smart staged processing", "Legacy extract frames"], value=roop.config.globals.CFG.video_swapping_method, label="Select video processing method", interactive=True)
+                video_swapping_method = gr.Dropdown(["Smart staged processing", "One-chain-all", "Legacy extract frames"], value=roop.config.globals.CFG.video_swapping_method, label="Select video processing method", interactive=True)
                 no_face_action = gr.Dropdown(choices=no_face_choices, value=roop.config.globals.CFG.no_face_action, label="Action on no face detected", interactive=True)
                 vr_mode = gr.Checkbox(label="VR Mode", value=roop.config.globals.CFG.vr_mode)
             with gr.Column(scale=1):
