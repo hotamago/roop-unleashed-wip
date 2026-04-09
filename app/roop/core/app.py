@@ -271,7 +271,7 @@ def batch_process_regular(output_method, files:list[ProcessEntry], masking_engin
             stage="prepare",
             current_step=1,
             total_steps=4,
-            detail="Extract frames, run the full chain per frame, then merge with ffmpeg",
+            detail="Stream source decode, process the full chain per frame into packed cache, then merge with ffmpeg",
             force_log=True,
         )
         executor = OneChainAllExecutor(output_method, progress, options)

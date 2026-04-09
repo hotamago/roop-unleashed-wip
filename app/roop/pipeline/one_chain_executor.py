@@ -7,6 +7,7 @@ import roop.config.globals
 import roop.media.ffmpeg_ops as ffmpeg
 import roop.utils as util
 from roop.media.capturer import get_video_frame_total
+from roop.media.video_io import open_video_capture
 from roop.pipeline.batch_executor import ProcessMgr
 from roop.pipeline.staged_executor.cache import (
     get_entry_file_identity,
@@ -16,6 +17,8 @@ from roop.pipeline.staged_executor.cache import (
     read_json,
     write_json,
 )
+from roop.pipeline.staged_executor.video_cache import VideoStageCache
+from roop.pipeline.staged_executor.video_iter import iter_video_chunk
 from roop.progress.status import set_processing_message
 from roop.utils.cache_paths import get_jobs_root
 
@@ -38,13 +41,36 @@ def get_one_chain_manifest_signature(entry, options, output_method):
     return hashlib.sha256(json_dumps(blob).encode("utf-8")).hexdigest()
 
 
-def list_extracted_frames(frame_dir):
-    image_format = getattr(roop.config.globals.CFG, "output_image_format", "png")
-    return sorted(Path(frame_dir).glob(f"*.{image_format}"))
+def get_one_chain_chunk_size():
+    for candidate in (
+        getattr(getattr(roop.config.globals, "CFG", None), "staged_chunk_size", None),
+        getattr(getattr(roop.config.globals, "CFG", None), "detect_pack_frame_count", None),
+    ):
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return 128
 
 
-def build_processed_frame_path(processed_dir, source_frame_path):
-    return Path(processed_dir) / Path(source_frame_path).name
+def iter_one_chain_ranges(start_frame, end_frame, chunk_size):
+    chunk_size = max(1, int(chunk_size))
+    for chunk_start in range(int(start_frame), int(end_frame), chunk_size):
+        yield chunk_start, min(int(end_frame), chunk_start + chunk_size)
+
+
+def get_one_chain_segment_key(start_frame, end_frame):
+    return f"{int(start_frame):06d}_{int(end_frame) - 1:06d}"
+
+
+def get_one_chain_segment_path(cache_dir, start_frame, end_frame):
+    return Path(cache_dir) / f"{get_one_chain_segment_key(start_frame, end_frame)}.mp4"
+
+
+def get_one_chain_frame_key(frame_number):
+    return f"f{int(frame_number):08d}"
 
 
 class OneChainAllExecutor:
@@ -68,8 +94,7 @@ class OneChainAllExecutor:
     def _prepare_job(self, entry):
         job_dir = get_one_chain_job_dir(entry, self.options, self.output_method)
         manifest_path = job_dir / "manifest.json"
-        extract_dir = job_dir / "source_frames"
-        processed_dir = job_dir / "processed_frames"
+        cache_dir = job_dir / "processed_cache"
         merged_video = job_dir / "merged.mp4"
         signature = get_one_chain_manifest_signature(entry, self.options, self.output_method)
 
@@ -86,22 +111,24 @@ class OneChainAllExecutor:
             manifest = {}
 
         job_dir.mkdir(parents=True, exist_ok=True)
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        processed_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(job_dir / "source_frames", ignore_errors=True)
+        shutil.rmtree(job_dir / "processed_frames", ignore_errors=True)
 
         manifest.update(
             {
                 "signature": signature,
                 "status": manifest.get("status", "pending"),
-                "extract_complete": bool(manifest.get("extract_complete", False)),
                 "process_complete": bool(manifest.get("process_complete", False)),
                 "merge_complete": bool(manifest.get("merge_complete", False)),
                 "final_complete": bool(manifest.get("final_complete", False)),
                 "frame_count": int(manifest.get("frame_count", 0) or 0),
+                "completed_frames": int(manifest.get("completed_frames", 0) or 0),
+                "segments": dict(manifest.get("segments") or {}),
             }
         )
         write_json(manifest_path, manifest)
-        return job_dir, manifest_path, manifest, extract_dir, processed_dir, merged_video
+        return job_dir, manifest_path, manifest, cache_dir, merged_video
 
     def _process_images(self, imagefiles):
         if not imagefiles:
@@ -110,104 +137,144 @@ class OneChainAllExecutor:
         process_mgr.set_progress_context("one_chain_images", f"{len(imagefiles)} image(s)", unit="images")
         process_mgr.run_batch([entry.filename for entry in imagefiles], [entry.finalname for entry in imagefiles], roop.config.globals.execution_threads)
 
-    def _extract_frames(self, entry, index, total_files, extract_dir, manifest, manifest_path, fps):
-        existing_frames = list_extracted_frames(extract_dir)
-        if manifest.get("extract_complete") and existing_frames:
-            manifest["frame_count"] = len(existing_frames)
-            write_json(manifest_path, manifest)
-            return existing_frames
+    def _process_stream_to_cache(self, entry, index, total_files, cache_dir, manifest, manifest_path, fps):
+        process_mgr = self._ensure_process_mgr()
+        process_mgr.set_progress_context("one_chain", entry.filename, index + 1, total_files, unit="frames")
 
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        set_processing_message(
-            "Extracting frames",
-            stage="extract",
-            target_name=entry.filename,
-            file_index=index + 1,
-            total_files=total_files,
-            current_step=1,
-            total_steps=4,
-            detail="One-chain-all: extracting source frames to cache",
-            force_log=True,
-        )
-        ffmpeg.extract_frames(
-            entry.filename,
-            entry.startframe,
-            entry.endframe,
-            fps,
-            temp_directory_path=str(extract_dir),
-        )
-        if not roop.config.globals.processing:
-            manifest["status"] = "interrupted"
-            manifest["extract_complete"] = False
-            write_json(manifest_path, manifest)
-            return []
-        extracted_frames = list_extracted_frames(extract_dir)
-        manifest["extract_complete"] = True
-        manifest["frame_count"] = len(extracted_frames)
+        capture = open_video_capture(entry.filename)
+        width = int(capture.get(3) or 0)
+        height = int(capture.get(4) or 0)
+        capture.release()
+
+        chunk_ranges = list(iter_one_chain_ranges(entry.startframe, entry.endframe, get_one_chain_chunk_size()))
+        expected_segment_keys = [get_one_chain_segment_key(start_frame, end_frame) for start_frame, end_frame in chunk_ranges]
+        segment_states = manifest.setdefault("segments", {})
+        for segment_path in Path(cache_dir).glob("*.mp4"):
+            if segment_path.stem not in expected_segment_keys:
+                segment_path.unlink(missing_ok=True)
+                segment_path.with_suffix(".idx.bin").unlink(missing_ok=True)
+
+        completed_frames = 0
+        for start_frame, end_frame in chunk_ranges:
+            segment_key = get_one_chain_segment_key(start_frame, end_frame)
+            segment_path = get_one_chain_segment_path(cache_dir, start_frame, end_frame)
+            segment_state = segment_states.get(segment_key) or {}
+            segment_frame_count = max(0, end_frame - start_frame)
+            if segment_path.exists() and segment_state.get("completed"):
+                segment_state["frame_count"] = segment_frame_count
+                completed_frames += segment_frame_count
+            else:
+                segment_path.unlink(missing_ok=True)
+                segment_path.with_suffix(".idx.bin").unlink(missing_ok=True)
+                segment_state = {"completed": False, "frame_count": segment_frame_count}
+            segment_states[segment_key] = segment_state
+
+        manifest["completed_frames"] = completed_frames
+        manifest["frame_count"] = max(0, entry.endframe - entry.startframe)
         write_json(manifest_path, manifest)
-        return extracted_frames
 
-    def _process_pending_frames(self, entry, index, total_files, extracted_frames, processed_dir, manifest, manifest_path):
-        pending_sources = []
-        pending_targets = []
-        for extracted_frame in extracted_frames:
-            processed_frame = build_processed_frame_path(processed_dir, extracted_frame)
-            if not processed_frame.exists():
-                pending_sources.append(str(extracted_frame))
-                pending_targets.append(str(processed_frame))
-
-        if not pending_sources:
+        if completed_frames >= manifest["frame_count"] and all(
+            (segment_states.get(get_one_chain_segment_key(start_frame, end_frame)) or {}).get("completed")
+            for start_frame, end_frame in chunk_ranges
+        ):
             manifest["process_complete"] = True
             write_json(manifest_path, manifest)
             return True
 
-        process_mgr = self._ensure_process_mgr()
-        process_mgr.set_progress_context("one_chain", entry.filename, index + 1, total_files, unit="frames")
         set_processing_message(
             "Running one-chain-all frame processing",
             stage="one_chain",
             target_name=entry.filename,
             file_index=index + 1,
             total_files=total_files,
-            current_step=2,
-            total_steps=4,
-            detail="Processing pending extracted frames through the full chain",
+            current_step=1,
+            total_steps=3,
+            detail="Streaming source decode + full-chain processing into packed video cache",
             force_log=True,
         )
-        process_mgr.run_batch(pending_sources, pending_targets, roop.config.globals.execution_threads)
-        if not roop.config.globals.processing:
-            manifest["status"] = "interrupted"
-            manifest["process_complete"] = False
+        manifest["status"] = "running"
+        stage_cache = VideoStageCache(
+            codec="auto",
+            crf=0,
+            preset="veryfast",
+            max_frame_extent=max(width, height),
+            fps=max(1, round(fps)),
+        )
+        processed_frames = completed_frames
+
+        for start_frame, end_frame in chunk_ranges:
+            segment_key = get_one_chain_segment_key(start_frame, end_frame)
+            segment_path = get_one_chain_segment_path(cache_dir, start_frame, end_frame)
+            segment_state = segment_states.setdefault(segment_key, {})
+            segment_frame_count = max(0, end_frame - start_frame)
+            if segment_path.exists() and segment_state.get("completed"):
+                continue
+
+            frame_cache = {}
+            frames_seen = 0
+            checkpoint_completed_frames = processed_frames
+            for frame_number, frame in iter_video_chunk(entry.filename, start_frame, end_frame, getattr(roop.config.globals.CFG, "prefetch_frames", 32)):
+                result = process_mgr.process_frame(frame)
+                if result is None:
+                    result = frame
+                frame_cache[get_one_chain_frame_key(frame_number)] = result
+                frames_seen += 1
+                processed_frames += 1
+
+            if not roop.config.globals.processing or frames_seen < segment_frame_count:
+                manifest["status"] = "interrupted"
+                manifest["process_complete"] = False
+                processed_frames = checkpoint_completed_frames
+                manifest["completed_frames"] = checkpoint_completed_frames
+                segment_state["completed"] = False
+                segment_path.unlink(missing_ok=True)
+                segment_path.with_suffix(".idx.bin").unlink(missing_ok=True)
+                write_json(manifest_path, manifest)
+                return False
+
+            stage_cache.write(segment_path, frame_cache)
+            segment_state["completed"] = True
+            segment_state["frame_count"] = segment_frame_count
+            manifest["completed_frames"] = processed_frames
             write_json(manifest_path, manifest)
-            return False
 
-        remaining = [
-            extracted_frame
-            for extracted_frame in extracted_frames
-            if not build_processed_frame_path(processed_dir, extracted_frame).exists()
-        ]
-        manifest["process_complete"] = not remaining
+        manifest["process_complete"] = True
         write_json(manifest_path, manifest)
-        return not remaining
+        return True
 
-    def _merge_processed_frames(self, entry, index, total_files, processed_dir, merged_video, manifest, manifest_path, fps):
+    def _merge_processed_segments(self, entry, index, total_files, cache_dir, merged_video, manifest, manifest_path):
         if manifest.get("merge_complete") and merged_video.exists():
             return True
 
         merged_video.unlink(missing_ok=True)
+        segment_paths = []
+        for start_frame, end_frame in iter_one_chain_ranges(entry.startframe, entry.endframe, get_one_chain_chunk_size()):
+            segment_key = get_one_chain_segment_key(start_frame, end_frame)
+            segment_state = (manifest.get("segments") or {}).get(segment_key) or {}
+            segment_path = get_one_chain_segment_path(cache_dir, start_frame, end_frame)
+            if segment_state.get("completed") and segment_path.exists():
+                segment_paths.append(str(segment_path))
+        if not segment_paths:
+            manifest["merge_complete"] = False
+            manifest["status"] = "interrupted"
+            write_json(manifest_path, manifest)
+            return False
+
         set_processing_message(
             "Merging processed frames",
             stage="encode",
             target_name=entry.filename,
             file_index=index + 1,
             total_files=total_files,
-            current_step=3,
-            total_steps=4,
-            detail="Encoding processed frame cache into a video",
+            current_step=2,
+            total_steps=3,
+            detail="Joining packed processed-cache segments into a single video",
             force_log=True,
         )
-        ffmpeg.create_video(entry.filename, str(merged_video), fps, temp_directory_path=str(processed_dir))
+        if len(segment_paths) == 1:
+            shutil.copyfile(segment_paths[0], str(merged_video))
+        else:
+            ffmpeg.join_videos(segment_paths, str(merged_video), True)
         merged_ok = merged_video.exists()
         manifest["merge_complete"] = merged_ok
         manifest["status"] = "interrupted" if not merged_ok else manifest.get("status", "running")
@@ -226,8 +293,8 @@ class OneChainAllExecutor:
             target_name=entry.filename,
             file_index=index + 1,
             total_files=total_files,
-            current_step=4,
-            total_steps=4,
+            current_step=3,
+            total_steps=3,
             detail="Muxing encoded video with the final container/output",
             force_log=True,
         )
@@ -248,7 +315,7 @@ class OneChainAllExecutor:
         if entry.endframe == 0:
             entry.endframe = get_video_frame_total(entry.filename)
         fps = entry.fps if entry.fps > 0 else util.detect_fps(entry.filename)
-        job_dir, manifest_path, manifest, extract_dir, processed_dir, merged_video = self._prepare_job(entry)
+        job_dir, manifest_path, manifest, cache_dir, merged_video = self._prepare_job(entry)
 
         destination = util.replace_template(entry.finalname, index=index)
         if manifest.get("final_complete") and os.path.isfile(destination):
@@ -258,19 +325,16 @@ class OneChainAllExecutor:
                 target_name=entry.filename,
                 file_index=index + 1,
                 total_files=total_files,
-                current_step=4,
-                total_steps=4,
+                current_step=3,
+                total_steps=3,
                 detail="Final output already exists for this job",
                 force_log=True,
             )
             return
 
-        extracted_frames = self._extract_frames(entry, index, total_files, extract_dir, manifest, manifest_path, fps)
-        if not extracted_frames:
+        if not self._process_stream_to_cache(entry, index, total_files, cache_dir, manifest, manifest_path, fps):
             return
-        if not self._process_pending_frames(entry, index, total_files, extracted_frames, processed_dir, manifest, manifest_path):
-            return
-        if not self._merge_processed_frames(entry, index, total_files, processed_dir, merged_video, manifest, manifest_path, fps):
+        if not self._merge_processed_segments(entry, index, total_files, cache_dir, merged_video, manifest, manifest_path):
             return
         self._finalize_output(entry, index, total_files, merged_video, manifest, manifest_path)
 
@@ -296,8 +360,11 @@ class OneChainAllExecutor:
 __all__ = [
     "ONE_CHAIN_PIPELINE_VERSION",
     "OneChainAllExecutor",
-    "build_processed_frame_path",
     "get_one_chain_job_dir",
+    "get_one_chain_chunk_size",
+    "get_one_chain_frame_key",
     "get_one_chain_manifest_signature",
-    "list_extracted_frames",
+    "get_one_chain_segment_key",
+    "get_one_chain_segment_path",
+    "iter_one_chain_ranges",
 ]
