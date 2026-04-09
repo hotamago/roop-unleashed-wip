@@ -267,14 +267,14 @@ def test_process_mgr_single_batch_worker_count_uses_memory_plan(monkeypatch):
     assert mgr.get_single_batch_worker_count(processor) == 3
 
 
-def test_process_mgr_single_batch_worker_count_caps_gpu_without_memory_plan(monkeypatch):
+def test_process_mgr_single_batch_worker_count_uses_requested_workers_without_memory_plan(monkeypatch):
     mgr = ProcessMgr(None)
     processor = FakeSingleBatchProcessor()
     monkeypatch.setattr(roop.config.globals, "active_memory_plan", None, raising=False)
     monkeypatch.setattr(roop.config.globals, "CFG", SimpleNamespace(single_batch_workers=4), raising=False)
-    monkeypatch.setattr("roop.pipeline.batch_executor.resolve_single_batch_workers", lambda configured_workers: (1, configured_workers, "GPU-safe cap"))
+    monkeypatch.setattr("roop.pipeline.batch_executor.resolve_single_batch_workers", lambda configured_workers: (configured_workers, configured_workers, None))
 
-    assert mgr.get_single_batch_worker_count(processor) == 1
+    assert mgr.get_single_batch_worker_count(processor) == 4
 
 
 def test_process_mgr_parallelizes_single_batch_enhancers(monkeypatch):

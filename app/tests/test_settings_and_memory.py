@@ -15,7 +15,6 @@ from roop.face_swap_models import (
 from roop.memory.planner import (
     describe_memory_plan,
     resolve_detect_single_batch_workers,
-    resolve_gpu_single_batch_worker_cap,
     resolve_memory_plan,
     resolve_single_batch_workers,
 )
@@ -207,7 +206,7 @@ def test_resolve_memory_plan_allows_gpu_single_batch_workers_when_vram_is_availa
     assert "single-batch workers=2" in describe_memory_plan(plan)
 
 
-def test_resolve_memory_plan_caps_gpu_single_batch_workers_on_low_vram(monkeypatch):
+def test_resolve_memory_plan_keeps_requested_single_batch_workers_on_low_vram(monkeypatch):
     monkeypatch.setattr("roop.memory.planner.provider_uses_gpu", lambda: True)
     monkeypatch.setattr(
         roop.config.globals,
@@ -230,42 +229,34 @@ def test_resolve_memory_plan_caps_gpu_single_batch_workers_on_low_vram(monkeypat
 
     plan = resolve_memory_plan(1920, 1080)
 
-    assert plan["single_batch_workers"] == 1
+    assert plan["single_batch_workers"] == 3
     assert plan["requested_single_batch_workers"] == 3
-    assert plan["single_batch_workers_reason"] == "GPU VRAM cap 1"
-    assert plan["detect_single_batch_workers"] == 1
+    assert plan["single_batch_workers_reason"] is None
+    assert plan["detect_single_batch_workers"] == 3
     assert plan["requested_detect_single_batch_workers"] == 3
-    assert plan["detect_single_batch_workers_reason"] == "GPU VRAM cap 1"
-    assert "detect workers=1 (requested 3, GPU VRAM cap 1)" in describe_memory_plan(plan)
-    assert "single-batch workers=1 (requested 3, GPU VRAM cap 1)" in describe_memory_plan(plan)
+    assert plan["detect_single_batch_workers_reason"] is None
+    assert "detect workers=3" in describe_memory_plan(plan)
+    assert "single-batch workers=3" in describe_memory_plan(plan)
 
 
-def test_resolve_single_batch_workers_keeps_cpu_parallelism(monkeypatch):
-    monkeypatch.setattr("roop.memory.planner.provider_uses_gpu", lambda: False)
+def test_resolve_single_batch_workers_keeps_requested_parallelism_on_gpu(monkeypatch):
+    monkeypatch.setattr("roop.memory.planner.provider_uses_gpu", lambda: True)
 
-    effective_workers, requested_workers, reason = resolve_single_batch_workers(4)
+    resolved_workers, requested_workers, reason = resolve_single_batch_workers(12)
 
-    assert effective_workers == 4
-    assert requested_workers == 4
+    assert resolved_workers == 12
+    assert requested_workers == 12
     assert reason is None
 
 
-def test_resolve_detect_single_batch_workers_keeps_cpu_parallelism(monkeypatch):
-    monkeypatch.setattr("roop.memory.planner.provider_uses_gpu", lambda: False)
+def test_resolve_detect_single_batch_workers_keeps_requested_parallelism_on_gpu(monkeypatch):
+    monkeypatch.setattr("roop.memory.planner.provider_uses_gpu", lambda: True)
 
-    effective_workers, requested_workers, reason = resolve_detect_single_batch_workers(4)
+    resolved_workers, requested_workers, reason = resolve_detect_single_batch_workers(12)
 
-    assert effective_workers == 4
-    assert requested_workers == 4
+    assert resolved_workers == 12
+    assert requested_workers == 12
     assert reason is None
-
-
-def test_resolve_gpu_single_batch_worker_cap_scales_with_vram():
-    assert resolve_gpu_single_batch_worker_cap(None) == 2
-    assert resolve_gpu_single_batch_worker_cap(9.0) == 1
-    assert resolve_gpu_single_batch_worker_cap(10.0) == 2
-    assert resolve_gpu_single_batch_worker_cap(14.0) == 3
-    assert resolve_gpu_single_batch_worker_cap(20.0) == 4
 
 
 def test_process_options_coerce_subsample_size_for_256_face_swap_models():

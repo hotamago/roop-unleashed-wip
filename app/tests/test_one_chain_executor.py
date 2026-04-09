@@ -183,7 +183,6 @@ def test_one_chain_stream_uses_execution_threads_for_video_workers(tmp_path, mon
 
     monkeypatch.setattr(roop.config.globals, "execution_threads", 3, raising=False)
     monkeypatch.setattr("roop.pipeline.one_chain_executor.resolve_single_batch_workers", lambda requested: (requested, requested, None))
-    monkeypatch.setattr("roop.pipeline.one_chain_executor.provider_uses_gpu", lambda: False)
     monkeypatch.setattr("roop.pipeline.one_chain_executor.get_jobs_root", lambda: tmp_path)
     monkeypatch.setattr("roop.pipeline.one_chain_executor.ProcessMgr", FakeProcessMgr)
     monkeypatch.setattr("roop.pipeline.one_chain_executor.VideoStageCache", FakeStageCache)
@@ -200,19 +199,18 @@ def test_one_chain_stream_uses_execution_threads_for_video_workers(tmp_path, mon
     assert created_workers == [(3, "one_chain")]
 
 
-def test_one_chain_worker_config_caps_gpu_face_pipeline_and_keeps_prefetch_window(monkeypatch):
+def test_one_chain_worker_config_keeps_requested_workers_and_prefetch_window(monkeypatch):
     monkeypatch.setattr(roop.config.globals, "execution_threads", 3, raising=False)
     monkeypatch.setattr(getattr(roop.config.globals, "CFG"), "prefetch_frames", 24, raising=False)
     monkeypatch.setattr("roop.pipeline.one_chain_executor.resolve_single_batch_workers", lambda requested: (requested, requested, None))
-    monkeypatch.setattr("roop.pipeline.one_chain_executor.provider_uses_gpu", lambda: True)
 
     config = resolve_one_chain_worker_config(make_options({"faceswap": {}, "mask_xseg": {}}))
 
     assert config["requested_threads"] == 3
-    assert config["effective_workers"] == 2
+    assert config["worker_count"] == 3
     assert config["prefetch_frames"] == 24
     assert config["max_in_flight"] == 24
-    assert "one-chain GPU face pipeline cap 2" in (config["reason"] or "")
+    assert config["reason"] is None
 
 
 def test_one_chain_reuses_worker_process_mgrs_across_segments(tmp_path, monkeypatch):

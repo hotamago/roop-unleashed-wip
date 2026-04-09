@@ -11,7 +11,7 @@ import roop.media.ffmpeg_ops as ffmpeg
 import roop.utils as util
 from roop.media.capturer import get_video_frame_total
 from roop.media.video_io import open_video_capture
-from roop.memory import provider_uses_gpu, resolve_single_batch_workers
+from roop.memory import resolve_single_batch_workers
 from roop.pipeline.batch_executor import ProcessMgr
 from roop.pipeline.staged_executor.cache import (
     AsyncWritePipeline,
@@ -92,26 +92,14 @@ def get_one_chain_prefetch_frames():
         return 32
 
 
-def _append_worker_reason(reason: str | None, extra_reason: str | None) -> str | None:
-    if not extra_reason:
-        return reason
-    if not reason:
-        return extra_reason
-    return f"{reason}; {extra_reason}"
-
-
 def resolve_one_chain_worker_config(options=None):
     requested_threads = get_one_chain_worker_count()
-    effective_workers, _requested_workers, reason = resolve_single_batch_workers(requested_threads)
-    processor_keys = set((getattr(options, "processors", None) or {}).keys())
-    if provider_uses_gpu() and "faceswap" in processor_keys and effective_workers > 2:
-        effective_workers = 2
-        reason = _append_worker_reason(reason, "one-chain GPU face pipeline cap 2")
+    worker_count, _requested_workers, reason = resolve_single_batch_workers(requested_threads)
     prefetch_frames = get_one_chain_prefetch_frames()
-    max_in_flight = max(prefetch_frames, requested_threads * 2, effective_workers)
+    max_in_flight = max(prefetch_frames, requested_threads * 2, worker_count)
     return {
         "requested_threads": requested_threads,
-        "effective_workers": effective_workers,
+        "worker_count": worker_count,
         "reason": reason,
         "prefetch_frames": prefetch_frames,
         "max_in_flight": max_in_flight,
@@ -304,7 +292,7 @@ class OneChainAllExecutor:
     def _process_stream_to_cache(self, entry, index, total_files, cache_dir, manifest, manifest_path, fps):
         process_mgr = None
         worker_config = resolve_one_chain_worker_config(self.options)
-        worker_count = worker_config["effective_workers"]
+        worker_count = worker_config["worker_count"]
         requested_threads = worker_config["requested_threads"]
         prefetch_frames = worker_config["prefetch_frames"]
         max_in_flight = worker_config["max_in_flight"]
