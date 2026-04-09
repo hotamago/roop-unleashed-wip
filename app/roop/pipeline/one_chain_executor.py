@@ -29,6 +29,7 @@ from roop.utils.cache_paths import get_jobs_root
 
 
 ONE_CHAIN_PIPELINE_VERSION = 1
+ONE_CHAIN_MERGE_PROFILE = "concat_reencode_v2"
 
 
 def get_one_chain_job_dir(entry, options, output_method):
@@ -265,25 +266,31 @@ class OneChainAllExecutor:
         else:
             manifest = {}
 
+        merge_profile_changed = manifest.get("merge_profile") != ONE_CHAIN_MERGE_PROFILE
+
         if manifest.get("signature") != signature:
             shutil.rmtree(job_dir, ignore_errors=True)
             manifest = {}
+            merge_profile_changed = False
 
         job_dir.mkdir(parents=True, exist_ok=True)
         cache_dir.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(job_dir / "source_frames", ignore_errors=True)
         shutil.rmtree(job_dir / "processed_frames", ignore_errors=True)
+        if merge_profile_changed:
+            merged_video.unlink(missing_ok=True)
 
         manifest.update(
             {
                 "signature": signature,
                 "status": manifest.get("status", "pending"),
                 "process_complete": bool(manifest.get("process_complete", False)),
-                "merge_complete": bool(manifest.get("merge_complete", False)),
-                "final_complete": bool(manifest.get("final_complete", False)),
+                "merge_complete": False if merge_profile_changed else bool(manifest.get("merge_complete", False)),
+                "final_complete": False if merge_profile_changed else bool(manifest.get("final_complete", False)),
                 "frame_count": int(manifest.get("frame_count", 0) or 0),
                 "completed_frames": int(manifest.get("completed_frames", 0) or 0),
                 "segments": dict(manifest.get("segments") or {}),
+                "merge_profile": ONE_CHAIN_MERGE_PROFILE,
             }
         )
         write_json(manifest_path, manifest)
@@ -542,20 +549,17 @@ class OneChainAllExecutor:
             total_files=total_files,
             current_step=2,
             total_steps=3,
-            detail="Joining packed processed-cache segments into a single video",
+            detail="Joining packed processed-cache segments and compressing the final merged video",
             force_log=True,
         )
         total_segments = max(len(segment_paths), 1)
-        self.update_progress("encode", detail="Joining packed processed-cache segments into a single video", step_completed=0, step_total=total_segments, step_unit="segments", rate_enabled=False, force_log=True)
-        if len(segment_paths) == 1:
-            shutil.copyfile(segment_paths[0], str(merged_video))
-        else:
-            ffmpeg.join_videos(segment_paths, str(merged_video), True)
+        self.update_progress("encode", detail="Joining packed processed-cache segments and compressing the final merged video", step_completed=0, step_total=total_segments, step_unit="segments", rate_enabled=False, force_log=True)
+        ffmpeg.join_videos(segment_paths, str(merged_video), True, reencode=True)
         merged_ok = merged_video.exists()
         manifest["merge_complete"] = merged_ok
         manifest["status"] = "interrupted" if not merged_ok else manifest.get("status", "running")
         write_json(manifest_path, manifest)
-        self.update_progress("encode", detail="Merged one-chain processed cache segments", step_completed=total_segments if merged_ok else 0, step_total=total_segments, step_unit="segments", rate_enabled=False, force_log=True)
+        self.update_progress("encode", detail="Merged one-chain processed cache segments into compressed final video", step_completed=total_segments if merged_ok else 0, step_total=total_segments, step_unit="segments", rate_enabled=False, force_log=True)
         return merged_ok
 
     def _finalize_output(self, entry, index, total_files, merged_video, manifest, manifest_path):

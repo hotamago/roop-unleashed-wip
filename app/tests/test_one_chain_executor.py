@@ -392,10 +392,11 @@ def test_one_chain_merge_reuses_completed_segment_videos(tmp_path, monkeypatch):
         }
     write_json(manifest_path, manifest)
 
-    def fake_join_videos(videos, destination, simple):
+    def fake_join_videos(videos, destination, simple, reencode=False):
         joined["videos"] = list(videos)
         joined["destination"] = destination
         joined["simple"] = simple
+        joined["reencode"] = reencode
         Path(destination).write_bytes(b"merged")
 
     monkeypatch.setattr("roop.pipeline.one_chain_executor.ffmpeg.join_videos", fake_join_videos)
@@ -410,3 +411,4 @@ def test_one_chain_merge_reuses_completed_segment_videos(tmp_path, monkeypatch):
     ]
     assert joined["destination"] == str(merged_video)
     assert joined["simple"] is True
+    assert joined["reencode"] is True
