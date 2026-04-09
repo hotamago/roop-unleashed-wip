@@ -1183,7 +1183,7 @@ class StagedBatchExecutor:
                     fallback_mgr.num_frames_no_face = 0
                 self.completed_units += 1
                 processed_frames += 1
-                self.update_progress("composite", detail="Streaming source decode + direct video encode", step_completed=processed_frames, step_total=frame_count, step_unit="frames")
+                self.update_progress("composite", detail="Streaming source decode + cached face compositing + video encode", step_completed=processed_frames, step_total=frame_count, step_unit="frames")
 
             if compose_worker_count == 1:
                 for frame_number, frame in iter_video_chunk(entry.filename, entry.startframe, endframe, memory_plan["prefetch_frames"]):

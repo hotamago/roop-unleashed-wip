@@ -317,3 +317,114 @@ def test_process_mgr_parallelizes_single_batch_masks(monkeypatch):
     assert set(outputs.keys()) == {"task_a", "task_b"}
     assert all(isinstance(value, np.ndarray) for value in outputs.values())
 
+
+def test_paste_upscale_uses_roi_warp_sizes(monkeypatch):
+    mgr = ProcessMgr(None)
+    mgr.options = SimpleNamespace(show_face_area_overlay=False, blend_ratio=0.5)
+    monkeypatch.setattr(mgr, "should_use_gpu_compositor", lambda: False)
+    target = np.zeros((512, 512, 3), dtype=np.uint8)
+    fake = np.full((512, 512, 3), 255, dtype=np.uint8)
+    matrix = np.array([[2.0, 0.0, 64.0], [0.0, 2.0, 64.0]], dtype=np.float32)
+    calls = []
+    real_warp_affine = batch_executor.cv2.warpAffine
+
+    def tracking_warp_affine(image, matrix_arg, dsize, *args, **kwargs):
+        calls.append(tuple(int(v) for v in dsize))
+        return real_warp_affine(image, matrix_arg, dsize, *args, **kwargs)
+
+    monkeypatch.setattr(batch_executor.cv2, "warpAffine", tracking_warp_affine)
+
+    result = mgr.paste_upscale(fake, fake, matrix, target, 1, [0, 0, 0, 0, 20.0])
+
+    assert result is target
+    assert calls
+    assert all(width < target.shape[1] and height < target.shape[0] for width, height in calls)
+
+
+def test_paste_upscale_falls_back_to_cpu_when_gpu_path_fails(monkeypatch):
+    mgr = ProcessMgr(None)
+    mgr.options = SimpleNamespace(show_face_area_overlay=False, blend_ratio=0.5)
+    monkeypatch.setattr(mgr, "should_use_gpu_compositor", lambda: True)
+    monkeypatch.setattr(mgr, "paste_upscale_torch", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("gpu failed")))
+    target = np.zeros((512, 512, 3), dtype=np.uint8)
+    fake = np.full((512, 512, 3), 255, dtype=np.uint8)
+    matrix = np.array([[2.0, 0.0, 64.0], [0.0, 2.0, 64.0]], dtype=np.float32)
+    calls = []
+    real_warp_affine = batch_executor.cv2.warpAffine
+
+    def tracking_warp_affine(image, matrix_arg, dsize, *args, **kwargs):
+        calls.append(tuple(int(v) for v in dsize))
+        return real_warp_affine(image, matrix_arg, dsize, *args, **kwargs)
+
+    monkeypatch.setattr(batch_executor.cv2, "warpAffine", tracking_warp_affine)
+
+    result = mgr.paste_upscale(fake, fake, matrix, target, 1, [0, 0, 0, 0, 20.0])
+
+    assert result is target
+    assert calls
+
+
+def test_compose_task_mutates_base_frame_in_place(monkeypatch):
+    mgr = ProcessMgr(None)
+    mgr.options = SimpleNamespace(show_face_area_overlay=False, blend_ratio=0.5, restore_original_mouth=False)
+    base = np.zeros((64, 64, 3), dtype=np.uint8)
+    fake = np.full((64, 64, 3), 123, dtype=np.uint8)
+    target_face = batch_executor.deserialize_face_payload(
+        {
+            "bbox": np.array([0, 0, 10, 10], dtype=np.float32),
+            "kps": np.array([[1, 1], [2, 1], [1.5, 1.5], [1.2, 2], [1.8, 2]], dtype=np.float32),
+            "matrix": np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        }
+    )
+    monkeypatch.setattr(mgr, "deserialize_face", lambda payload: target_face)
+
+    task = {
+        "target_face": {},
+        "mask_offsets": [0, 0, 0, 0, 20.0],
+        "rotation_action": None,
+        "cutout_box": None,
+    }
+
+    result = mgr.compose_task(base, task, fake)
+
+    assert result is base
+
+
+def test_compose_tasks_batch_uses_gpu_batch_path(monkeypatch):
+    mgr = ProcessMgr(None)
+    mgr.options = SimpleNamespace(show_face_area_overlay=False, blend_ratio=0.5, restore_original_mouth=False)
+    target_face = batch_executor.deserialize_face_payload(
+        {
+            "bbox": np.array([0, 0, 10, 10], dtype=np.float32),
+            "kps": np.array([[1, 1], [2, 1], [1.5, 1.5], [1.2, 2], [1.8, 2]], dtype=np.float32),
+            "matrix": np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        }
+    )
+    monkeypatch.setattr(mgr, "deserialize_face", lambda payload: target_face)
+    monkeypatch.setattr(mgr, "should_use_gpu_compositor", lambda: True)
+    batch_calls = []
+
+    def fake_paste_upscale_torch_batch(items):
+        batch_calls.append(len(items))
+        for item in items:
+            item["base_frame"][:] = 77
+        return [item["base_frame"] for item in items]
+
+    monkeypatch.setattr(mgr, "paste_upscale_torch_batch", fake_paste_upscale_torch_batch)
+
+    task = {
+        "target_face": {},
+        "mask_offsets": [0, 0, 0, 0, 20.0],
+        "rotation_action": None,
+        "cutout_box": None,
+    }
+    batch_items = [
+        {"base_frame": np.zeros((64, 64, 3), dtype=np.uint8), "task": task, "fake_frame": np.full((64, 64, 3), 10, dtype=np.uint8), "enhanced_frame": None},
+        {"base_frame": np.zeros((64, 64, 3), dtype=np.uint8), "task": task, "fake_frame": np.full((64, 64, 3), 20, dtype=np.uint8), "enhanced_frame": None},
+    ]
+
+    results = mgr.compose_tasks_batch(batch_items)
+
+    assert batch_calls == [2]
+    assert all(result.mean() == 77 for result in results)
+

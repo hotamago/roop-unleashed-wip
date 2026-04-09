@@ -14,6 +14,7 @@ Copyright (c) 2023 Janvarev Vladislav
 
 import os
 import subprocess as sp
+import numpy as np
 
 PIPE = -1
 STDOUT = -2
@@ -154,10 +155,11 @@ class FFMPEG_VideoWriter:
     def write_frame(self, img_array):
         """ Writes one frame in the file."""
         try:
-            #if PY3:
-            self.proc.stdin.write(img_array.tobytes())
-            # else:
-            #    self.proc.stdin.write(img_array.tostring())
+            if not isinstance(img_array, np.ndarray):
+                img_array = np.asarray(img_array, dtype=np.uint8)
+            if not img_array.flags["C_CONTIGUOUS"]:
+                img_array = np.ascontiguousarray(img_array)
+            self.proc.stdin.write(memoryview(img_array))
         except IOError as err:
             _, ffmpeg_error = self.proc.communicate()
             error = (str(err) + ("\n\nroop unleashed error: FFMPEG encountered "
@@ -199,6 +201,29 @@ class FFMPEG_VideoWriter:
                   "or file extension you provided is not a video")
 
 
+            raise IOError(error)
+
+    def write_frames(self, frame_arrays):
+        if not frame_arrays:
+            return
+        if len(frame_arrays) == 1:
+            self.write_frame(frame_arrays[0])
+            return
+        try:
+            contiguous_frames = []
+            for frame in frame_arrays:
+                if not isinstance(frame, np.ndarray):
+                    frame = np.asarray(frame, dtype=np.uint8)
+                if not frame.flags["C_CONTIGUOUS"]:
+                    frame = np.ascontiguousarray(frame)
+                contiguous_frames.append(frame)
+            batch = np.ascontiguousarray(np.stack(contiguous_frames, axis=0))
+            self.proc.stdin.write(memoryview(batch))
+        except IOError as err:
+            _, ffmpeg_error = self.proc.communicate()
+            error = (str(err) + ("\n\nroop unleashed error: FFMPEG encountered "
+                                 "the following error while writing file %s:"
+                                 "\n\n %s" % (self.filename, str(ffmpeg_error))))
             raise IOError(error)
 
     def close(self):

@@ -16,6 +16,7 @@ from roop.pipeline.staged_executor.executor import (
     write_cache_blob,
 )
 from roop.pipeline.staged_executor import cache as stage_cache_lib
+from roop.pipeline.staged_executor import compose_stage as compose_stage_lib
 
 
 def make_options(processors):
@@ -580,6 +581,14 @@ def test_ensure_full_compose_stage_writes_cached_swapped_frames(tmp_path, monkey
             "f000002_t000": swapped_frame.copy(),
         },
     )
+    monkeypatch.setattr(
+        executor,
+        "read_stage_cache_keys",
+        lambda _path, _keys: {
+            "f000001_t000": swapped_frame.copy(),
+            "f000002_t000": swapped_frame.copy(),
+        },
+    )
     monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
     monkeypatch.setattr(roop.config.globals.CFG, "max_threads", 1, raising=False)
     monkeypatch.setattr(roop.config.globals, "no_face_action", eNoFaceAction.USE_ORIGINAL_FRAME, raising=False)
@@ -601,6 +610,228 @@ def test_ensure_full_compose_stage_writes_cached_swapped_frames(tmp_path, monkey
     assert len(written_frames) == 2
     assert np.array_equal(written_frames[0], swapped_frame)
     assert np.array_equal(written_frames[1], swapped_frame)
+
+
+def test_ensure_full_compose_stage_does_not_reuse_partial_intermediate(tmp_path, monkeypatch):
+    executor = StagedBatchExecutor("File", None, make_options({"faceswap": {}}))
+    entry = ProcessEntry("clip.mp4", 0, 2, 30.0)
+    intermediate_video = tmp_path / "composite.mp4"
+    intermediate_video.write_bytes(b"stale")
+    stages = {"composite": True}
+    manifest = {"frame_count": 2, "composite_state": {"completed_frames": 1}}
+    memory_plan = {"prefetch_frames": 2}
+    writes = []
+
+    class FakeCapture:
+        def get(self, prop):
+            if prop == 3:
+                return 2
+            if prop == 4:
+                return 2
+            return 0
+
+        def release(self):
+            return None
+
+    class FakeWriter:
+        def __init__(self, filename, *_args, **_kwargs):
+            self.filename = filename
+
+        def write_frame(self, frame):
+            writes.append(frame.copy())
+
+        def write_frames(self, frames):
+            for frame in frames:
+                writes.append(frame.copy())
+
+        def close(self):
+            with open(self.filename, "wb") as handle:
+                handle.write(b"ok")
+
+    class FakeProcessMgr:
+        def __init__(self, _progress):
+            return None
+
+        def initialize(self, *_args, **_kwargs):
+            return None
+
+        def compose_task(self, result, _task_meta, fake_frame, _enhanced_frame=None):
+            return fake_frame.copy()
+
+        def release_resources(self):
+            return None
+
+    def fake_iter_detect_packs(_detect_dir):
+        return [
+            {
+                "start_sequence": 1,
+                "end_sequence": 2,
+                "frames": [
+                    {"frame_number": 0, "tasks": [{"cache_key": "task_a", "target_face": {}, "mask_offsets": [0] * 10}], "fallback": False},
+                    {"frame_number": 1, "tasks": [{"cache_key": "task_b", "target_face": {}, "mask_offsets": [0] * 10}], "fallback": False},
+                ],
+            }
+        ]
+
+    def fake_iter_video_chunk(_video_path, frame_start, frame_end, _prefetch_frames):
+        for frame_number in range(frame_start, frame_end):
+            yield frame_number, np.zeros((2, 2, 3), dtype=np.uint8)
+
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.open_video_capture", lambda _path: FakeCapture())
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.FFMPEG_VideoWriter", FakeWriter)
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.ProcessMgr", FakeProcessMgr)
+    monkeypatch.setattr("roop.pipeline.staged_executor.video_iter.iter_video_chunk", fake_iter_video_chunk)
+    monkeypatch.setattr(executor, "iter_detect_packs", fake_iter_detect_packs)
+    monkeypatch.setattr(executor, "read_stage_cache_keys", lambda _path, _keys: {"task_a": np.full((2, 2, 3), 111, dtype=np.uint8), "task_b": np.full((2, 2, 3), 222, dtype=np.uint8)})
+    monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr(roop.config.globals, "processing", True, raising=False)
+
+    executor.ensure_full_compose_stage(
+        entry,
+        2,
+        30.0,
+        tmp_path / "detect",
+        tmp_path / "swap",
+        tmp_path / "mask",
+        tmp_path / "enhance",
+        intermediate_video,
+        stages,
+        manifest,
+        memory_plan,
+    )
+
+    assert stages["composite"] is True
+    assert manifest["composite_state"]["completed_frames"] == 2
+    assert len(writes) == 2
+
+
+def test_ensure_full_compose_stage_removes_partial_intermediate_when_interrupted(tmp_path, monkeypatch):
+    executor = StagedBatchExecutor("File", None, make_options({"faceswap": {}}))
+    entry = ProcessEntry("clip.mp4", 0, 2, 30.0)
+    intermediate_video = tmp_path / "composite.mp4"
+    stages = {"composite": False}
+    manifest = {"frame_count": 2, "composite_state": {"completed_frames": 0}}
+    memory_plan = {"prefetch_frames": 2}
+
+    class FakeCapture:
+        def get(self, prop):
+            if prop == 3:
+                return 2
+            if prop == 4:
+                return 2
+            return 0
+
+        def release(self):
+            return None
+
+    class FakeWriter:
+        def __init__(self, filename, *_args, **_kwargs):
+            self.filename = filename
+
+        def write_frame(self, _frame):
+            return None
+
+        def write_frames(self, _frames):
+            return None
+
+        def close(self):
+            with open(self.filename, "wb") as handle:
+                handle.write(b"partial")
+
+    class FakeProcessMgr:
+        def __init__(self, _progress):
+            return None
+
+        def initialize(self, *_args, **_kwargs):
+            return None
+
+        def compose_task(self, result, _task_meta, fake_frame, _enhanced_frame=None):
+            return fake_frame.copy()
+
+        def release_resources(self):
+            return None
+
+    def fake_iter_detect_packs(_detect_dir):
+        return [
+            {
+                "start_sequence": 1,
+                "end_sequence": 2,
+                "frames": [
+                    {"frame_number": 0, "tasks": [{"cache_key": "task_a", "target_face": {}, "mask_offsets": [0] * 10}], "fallback": False},
+                    {"frame_number": 1, "tasks": [{"cache_key": "task_b", "target_face": {}, "mask_offsets": [0] * 10}], "fallback": False},
+                ],
+            }
+        ]
+
+    def fake_iter_video_chunk(_video_path, frame_start, frame_end, _prefetch_frames):
+        if frame_start < frame_end:
+            yield frame_start, np.zeros((2, 2, 3), dtype=np.uint8)
+            monkeypatch.setattr(roop.config.globals, "processing", False, raising=False)
+
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.open_video_capture", lambda _path: FakeCapture())
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.FFMPEG_VideoWriter", FakeWriter)
+    monkeypatch.setattr("roop.pipeline.staged_executor.compose_stage.ProcessMgr", FakeProcessMgr)
+    monkeypatch.setattr("roop.pipeline.staged_executor.video_iter.iter_video_chunk", fake_iter_video_chunk)
+    monkeypatch.setattr(executor, "iter_detect_packs", fake_iter_detect_packs)
+    monkeypatch.setattr(executor, "read_stage_cache_keys", lambda _path, _keys: {"task_a": np.full((2, 2, 3), 111, dtype=np.uint8), "task_b": np.full((2, 2, 3), 222, dtype=np.uint8)})
+    monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
+    monkeypatch.setattr(roop.config.globals, "processing", True, raising=False)
+
+    executor.ensure_full_compose_stage(
+        entry,
+        2,
+        30.0,
+        tmp_path / "detect",
+        tmp_path / "swap",
+        tmp_path / "mask",
+        tmp_path / "enhance",
+        intermediate_video,
+        stages,
+        manifest,
+        memory_plan,
+    )
+
+    assert stages["composite"] is False
+    assert manifest["composite_state"]["completed_frames"] == 1
+    assert intermediate_video.exists() is False
+
+
+def test_compose_frames_from_cache_batch_uses_compose_mgr_batch_path():
+    frame_a = np.zeros((2, 2, 3), dtype=np.uint8)
+    frame_b = np.zeros((2, 2, 3), dtype=np.uint8)
+    input_cache = {
+        "task_a": np.full((2, 2, 3), 11, dtype=np.uint8),
+        "task_b": np.full((2, 2, 3), 22, dtype=np.uint8),
+    }
+
+    class FakeComposeMgr:
+        def __init__(self):
+            self.batch_calls = []
+
+        def should_use_gpu_compositor(self):
+            return True
+
+        def compose_tasks_batch(self, items):
+            self.batch_calls.append(len(items))
+            for index, item in enumerate(items):
+                item["base_frame"][:] = index + 1
+            return [item["base_frame"] for item in items]
+
+    compose_mgr = FakeComposeMgr()
+    results = compose_stage_lib.compose_frames_from_cache_batch(
+        SimpleNamespace(enhancer_name=None),
+        compose_mgr,
+        [
+            (frame_a, {"tasks": [{"cache_key": "task_a"}], "fallback": False}),
+            (frame_b, {"tasks": [{"cache_key": "task_b"}], "fallback": False}),
+        ],
+        input_cache,
+        {},
+    )
+
+    assert compose_mgr.batch_calls == [2]
+    assert results[0].mean() == 1
+    assert results[1].mean() == 2
 
 
 def test_pipeline_steps_and_detect_pack_ranges_follow_current_config(monkeypatch):

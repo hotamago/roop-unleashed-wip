@@ -4,6 +4,13 @@ import numpy as np
 import psutil
 import time
 
+try:
+    import torch
+    import torch.nn.functional as torch_functional
+except Exception:
+    torch = None
+    torch_functional = None
+
 from roop.pipeline.options import ProcessOptions
 
 from roop.face import align_crop, get_face_analyser, get_first_face, get_all_faces, rotate_anticlockwise, rotate_clockwise, clamp_cut_values
@@ -107,6 +114,10 @@ class ProcessMgr():
         self.progress_unit = "frames"
         self.progress_started_at = None
         self.single_batch_worker_pools = {}
+        self.gpu_composite_enabled = None
+        self.gpu_composite_device = None
+        self.gpu_composite_grid_cache = {}
+        self.gpu_composite_kernel_cache = {}
 
         if progress is not None:
             self.progress_gradio = progress
@@ -143,6 +154,10 @@ class ProcessMgr():
 
     def initialize(self, input_faces, target_faces, options):
         self.release_single_batch_worker_pools()
+        self.gpu_composite_enabled = None
+        self.gpu_composite_device = None
+        self.gpu_composite_grid_cache.clear()
+        self.gpu_composite_kernel_cache.clear()
         self.input_face_datas = input_faces
         self.target_face_datas = target_faces
         self.num_frames_no_face = 0
@@ -862,18 +877,98 @@ class ProcessMgr():
         scale_factor = int(upscale / max(orig_width, 1))
         face_lm = self.get_face_outline_landmarks(target_face)
         if enhanced_frame is None:
-            result = self.paste_upscale(fake_frame, fake_frame, target_face.matrix, target_img, scale_factor, task["mask_offsets"], face_landmarks=face_lm)
+            self.paste_upscale(fake_frame, fake_frame, target_face.matrix, target_img, scale_factor, task["mask_offsets"], face_landmarks=face_lm)
         else:
-            result = self.paste_upscale(fake_frame, enhanced_frame, target_face.matrix, target_img, scale_factor, task["mask_offsets"], face_landmarks=face_lm)
+            self.paste_upscale(fake_frame, enhanced_frame, target_face.matrix, target_img, scale_factor, task["mask_offsets"], face_landmarks=face_lm)
 
         if self.options.restore_original_mouth:
             mouth_cutout, mouth_bb, mouth_polygon = self.create_mouth_mask(target_face, target_img, task["mask_offsets"])
-            result = self.apply_mouth_area(result, mouth_cutout, mouth_bb, mouth_polygon, task["mask_offsets"][5])
+            self.apply_mouth_area(target_img, mouth_cutout, mouth_bb, mouth_polygon, task["mask_offsets"][5])
 
         if rotation_action is not None and cutout_box is not None:
-            unrotated = self.auto_unrotate_frame(result, rotation_action)
+            unrotated = self.auto_unrotate_frame(target_img, rotation_action)
             return self.paste_simple(unrotated, base_frame, cutout_box[0], cutout_box[1])
-        return result
+        return base_frame
+
+    def is_gpu_compose_task_batchable(self, task):
+        if not self.should_use_gpu_compositor():
+            return False
+        if getattr(self.options, "restore_original_mouth", False):
+            return False
+        if task.get("rotation_action") is not None:
+            return False
+        if task.get("cutout_box") is not None:
+            return False
+        return True
+
+    def prepare_compose_batch_item(self, base_frame, task, fake_frame, enhanced_frame=None, gpu_batch=False):
+        target_face = self.deserialize_face(task["target_face"])
+        upscale = 512
+        orig_width = fake_frame.shape[1]
+        prepared_fake = fake_frame
+        if orig_width != upscale and not gpu_batch:
+            prepared_fake = cv2.resize(fake_frame, (upscale, upscale), cv2.INTER_CUBIC)
+        scale_factor = int(upscale / max(orig_width, 1))
+        prepared_upsk = enhanced_frame if enhanced_frame is not None else prepared_fake
+        face_landmarks = self.get_face_outline_landmarks(target_face)
+        return {
+            "base_frame": base_frame,
+            "target_face": target_face,
+            "fake_face": prepared_fake,
+            "upsk_face": prepared_upsk,
+            "scale_factor": scale_factor,
+            "mask_offsets": task["mask_offsets"],
+            "face_landmarks": face_landmarks,
+            "target_size": upscale,
+        }
+
+    def compose_tasks_batch(self, batch_items):
+        if not batch_items:
+            return []
+        if not self.should_use_gpu_compositor():
+            return [
+                self.compose_task(item["base_frame"], item["task"], item["fake_frame"], item.get("enhanced_frame"))
+                for item in batch_items
+            ]
+
+        prepared_items = []
+        results = [None] * len(batch_items)
+        for index, item in enumerate(batch_items):
+            task = item["task"]
+            if not self.is_gpu_compose_task_batchable(task):
+                results[index] = self.compose_task(item["base_frame"], task, item["fake_frame"], item.get("enhanced_frame"))
+                continue
+            prepared_items.append((index, self.prepare_compose_batch_item(item["base_frame"], task, item["fake_frame"], item.get("enhanced_frame"), gpu_batch=True)))
+
+        grouped_items = {}
+        for index, prepared in prepared_items:
+            group_key = (
+                tuple(int(v) for v in prepared["upsk_face"].shape[:2]),
+                tuple(int(v) for v in prepared["fake_face"].shape[:2]),
+                prepared["upsk_face"] is prepared["fake_face"],
+            )
+            grouped_items.setdefault(group_key, []).append((index, prepared))
+
+        for group in grouped_items.values():
+            indices = [index for index, _prepared in group]
+            payloads = [prepared for _index, prepared in group]
+            try:
+                self.paste_upscale_torch_batch(payloads)
+                for result_index, prepared in zip(indices, payloads):
+                    results[result_index] = prepared["base_frame"]
+            except Exception:
+                for result_index, prepared in zip(indices, payloads):
+                    results[result_index] = self.paste_upscale(
+                        prepared["fake_face"],
+                        prepared["upsk_face"],
+                        prepared["target_face"].matrix,
+                        prepared["base_frame"],
+                        prepared["scale_factor"],
+                        prepared["mask_offsets"],
+                        face_landmarks=prepared["face_landmarks"],
+                    )
+
+        return results
 
 
     def run_batch(self, source_files, target_files, threads:int = 1):
@@ -1350,12 +1445,452 @@ class ProcessMgr():
         blended_image = image1.astype(np.float32) * (1.0 - mask) + image2.astype(np.float32) * mask
         return blended_image.astype(np.uint8)
 
+    def should_use_gpu_compositor(self):
+        if self.gpu_composite_enabled is not None:
+            return self.gpu_composite_enabled
+        enabled = False
+        if torch is not None and torch_functional is not None and torch.cuda.is_available():
+            enabled = get_device() in ("cuda", "tensorrt", "rocm")
+        self.gpu_composite_enabled = enabled
+        return enabled
+
+    def get_gpu_composite_device(self):
+        if not self.should_use_gpu_compositor():
+            return None
+        if self.gpu_composite_device is None:
+            device_index = int(getattr(roop.config.globals, "cuda_device_id", 0))
+            self.gpu_composite_device = torch.device(f"cuda:{device_index}")
+        return self.gpu_composite_device
+
+    def get_gpu_base_grid(self, roi_shape, device):
+        cache_key = (str(device), int(roi_shape[0]), int(roi_shape[1]))
+        cached_grid = self.gpu_composite_grid_cache.get(cache_key)
+        if cached_grid is not None:
+            return cached_grid
+        height, width = int(roi_shape[0]), int(roi_shape[1])
+        ys = torch.arange(height, device=device, dtype=torch.float32)
+        xs = torch.arange(width, device=device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        self.gpu_composite_grid_cache[cache_key] = (grid_x, grid_y)
+        return grid_x, grid_y
+
+    def get_gpu_gaussian_kernel(self, kernel_size, device):
+        kernel_size = max(1, int(kernel_size))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        cache_key = (str(device), kernel_size)
+        cached_kernel = self.gpu_composite_kernel_cache.get(cache_key)
+        if cached_kernel is not None:
+            return cached_kernel
+        center = float(kernel_size - 1) / 2.0
+        sigma = max(0.8, 0.3 * (center - 1.0) + 0.8)
+        axis = torch.arange(kernel_size, device=device, dtype=torch.float32) - center
+        kernel = torch.exp(-(axis * axis) / (2.0 * sigma * sigma))
+        kernel = kernel / torch.clamp(kernel.sum(), min=1e-6)
+        self.gpu_composite_kernel_cache[cache_key] = kernel
+        return kernel
+
+    def gaussian_blur_torch(self, image_tensor, kernel_size):
+        if torch_functional is None:
+            return image_tensor
+        kernel_size = max(1, int(kernel_size))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        if kernel_size <= 1:
+            return image_tensor
+        device = image_tensor.device
+        kernel = self.get_gpu_gaussian_kernel(kernel_size, device)
+        channels = image_tensor.shape[1]
+        kernel_x = kernel.view(1, 1, 1, kernel_size).expand(channels, 1, 1, kernel_size)
+        kernel_y = kernel.view(1, 1, kernel_size, 1).expand(channels, 1, kernel_size, 1)
+        pad = kernel_size // 2
+        blurred = torch_functional.conv2d(image_tensor, kernel_x, padding=(0, pad), groups=channels)
+        blurred = torch_functional.conv2d(blurred, kernel_y, padding=(pad, 0), groups=channels)
+        return blurred
+
+    def blur_area_torch(self, matte_tensor, face_mask_blend):
+        matte_tensor = self.gaussian_blur_torch(matte_tensor, 3)
+        if face_mask_blend <= 0:
+            return matte_tensor
+        matte_2d = matte_tensor[0, 0]
+        indices = torch.nonzero(matte_2d > 127.0, as_tuple=False)
+        if indices.numel() == 0:
+            return matte_tensor
+        mask_h = int(indices[:, 0].max().item() - indices[:, 0].min().item())
+        mask_w = int(indices[:, 1].max().item() - indices[:, 1].min().item())
+        mask_size = int(np.sqrt(max(mask_h, 1) * max(mask_w, 1)))
+        blend_px = max(1, int(mask_size * float(face_mask_blend) / 200))
+        blur_size = blend_px * 2 + 1
+        return self.gaussian_blur_torch(matte_tensor, blur_size)
+
+    def numpy_to_torch_image(self, image, device):
+        contiguous = np.ascontiguousarray(image)
+        if contiguous.ndim == 2:
+            tensor = torch.from_numpy(contiguous).to(device=device, dtype=torch.float32)
+            return tensor.unsqueeze(0).unsqueeze(0)
+        tensor = torch.from_numpy(contiguous).to(device=device, dtype=torch.float32)
+        return tensor.permute(2, 0, 1).unsqueeze(0)
+
+    def torch_to_numpy_image(self, image_tensor):
+        image_tensor = image_tensor.detach().clamp(0.0, 255.0)
+        if image_tensor.shape[1] == 1:
+            array = image_tensor[0, 0].round().to(torch.uint8).cpu().numpy()
+            return array
+        array = image_tensor[0].permute(1, 2, 0).round().to(torch.uint8).cpu().numpy()
+        return array
+
+    def warp_affine_torch(self, image, matrix, roi_shape, device, padding_mode="zeros"):
+        if torch_functional is None:
+            raise RuntimeError("torch functional unavailable")
+        roi_height, roi_width = int(roi_shape[0]), int(roi_shape[1])
+        if roi_height <= 0 or roi_width <= 0:
+            raise ValueError("invalid ROI shape")
+        source_height, source_width = image.shape[:2]
+        if source_height <= 0 or source_width <= 0:
+            raise ValueError("invalid source shape")
+        image_tensor = self.numpy_to_torch_image(image, device)
+        grid_x, grid_y = self.get_gpu_base_grid((roi_height, roi_width), device)
+        matrix_tensor = torch.as_tensor(matrix, device=device, dtype=torch.float32)
+        source_x = matrix_tensor[0, 0] * grid_x + matrix_tensor[0, 1] * grid_y + matrix_tensor[0, 2]
+        source_y = matrix_tensor[1, 0] * grid_x + matrix_tensor[1, 1] * grid_y + matrix_tensor[1, 2]
+        if source_width > 1:
+            norm_x = (source_x / float(source_width - 1)) * 2.0 - 1.0
+        else:
+            norm_x = torch.zeros_like(source_x)
+        if source_height > 1:
+            norm_y = (source_y / float(source_height - 1)) * 2.0 - 1.0
+        else:
+            norm_y = torch.zeros_like(source_y)
+        grid = torch.stack((norm_x, norm_y), dim=-1).unsqueeze(0)
+        return torch_functional.grid_sample(
+            image_tensor,
+            grid,
+            mode="bilinear",
+            padding_mode=padding_mode,
+            align_corners=True,
+        )
+
+    def warp_affine_torch_batch(self, image_batch, matrix_batch, roi_shapes, device, padding_mode="zeros"):
+        if torch_functional is None:
+            raise RuntimeError("torch functional unavailable")
+        if not roi_shapes:
+            raise ValueError("empty roi shapes")
+        max_height = max(int(shape[0]) for shape in roi_shapes)
+        max_width = max(int(shape[1]) for shape in roi_shapes)
+        if max_height <= 0 or max_width <= 0:
+            raise ValueError("invalid roi shape")
+        source_height = int(image_batch.shape[2])
+        source_width = int(image_batch.shape[3])
+        grid_x, grid_y = self.get_gpu_base_grid((max_height, max_width), device)
+        source_x = matrix_batch[:, 0, 0].view(-1, 1, 1) * grid_x + matrix_batch[:, 0, 1].view(-1, 1, 1) * grid_y + matrix_batch[:, 0, 2].view(-1, 1, 1)
+        source_y = matrix_batch[:, 1, 0].view(-1, 1, 1) * grid_x + matrix_batch[:, 1, 1].view(-1, 1, 1) * grid_y + matrix_batch[:, 1, 2].view(-1, 1, 1)
+        if source_width > 1:
+            norm_x = (source_x / float(source_width - 1)) * 2.0 - 1.0
+        else:
+            norm_x = torch.zeros_like(source_x)
+        if source_height > 1:
+            norm_y = (source_y / float(source_height - 1)) * 2.0 - 1.0
+        else:
+            norm_y = torch.zeros_like(source_y)
+        grid = torch.stack((norm_x, norm_y), dim=-1)
+        warped = torch_functional.grid_sample(
+            image_batch,
+            grid,
+            mode="bilinear",
+            padding_mode=padding_mode,
+            align_corners=True,
+        )
+        valid_mask = torch.zeros((len(roi_shapes), 1, max_height, max_width), device=device, dtype=warped.dtype)
+        for index, (roi_height, roi_width) in enumerate(roi_shapes):
+            valid_mask[index, :, : int(roi_height), : int(roi_width)] = 1.0
+        return warped * valid_mask, valid_mask
+
+    def paste_upscale_torch(self, fake_face, upsk_face, M, target_img, scale_factor, mask_offsets, face_landmarks=None):
+        device = self.get_gpu_composite_device()
+        if device is None:
+            return None
+        with torch.no_grad():
+            M_scale = M * scale_factor
+            IM = cv2.invertAffineTransform(M_scale)
+
+            source_height, source_width = upsk_face.shape[:2]
+            source_corners = np.array(
+                [
+                    [0.0, 0.0],
+                    [float(source_width), 0.0],
+                    [float(source_width), float(source_height)],
+                    [0.0, float(source_height)],
+                ],
+                dtype=np.float32,
+            )
+            warped_corners = cv2.transform(source_corners.reshape(1, -1, 2), IM).reshape(-1, 2)
+            min_corner = np.floor(np.min(warped_corners, axis=0)).astype(np.int32)
+            max_corner = np.ceil(np.max(warped_corners, axis=0)).astype(np.int32)
+            roi_width = max_corner[0] - min_corner[0]
+            roi_height = max_corner[1] - min_corner[1]
+            target_box_scale = float(np.sqrt(max(roi_width, 1) * max(roi_height, 1)))
+            blend_px = max(2, int(target_box_scale * float(mask_offsets[4]) / 200))
+            pad = max(4, blend_px + 2)
+            x0 = max(0, int(min_corner[0]) - pad)
+            y0 = max(0, int(min_corner[1]) - pad)
+            x1 = min(target_img.shape[1], int(max_corner[0]) + pad)
+            y1 = min(target_img.shape[0], int(max_corner[1]) + pad)
+            if x1 <= x0 or y1 <= y0:
+                return target_img
+
+            local_IM = IM.copy()
+            local_IM[0, 2] -= x0
+            local_IM[1, 2] -= y0
+            roi_shape = (y1 - y0, x1 - x0)
+
+            img_matte = np.zeros((source_height, source_width), dtype=np.uint8)
+            top = int(mask_offsets[0] * source_height)
+            bottom = int(source_height - (mask_offsets[1] * source_height))
+            left = int(mask_offsets[2] * source_width)
+            right = int(source_width - (mask_offsets[3] * source_width))
+            cx = (left + right) // 2
+            cy = (top + bottom) // 2
+            ax = max(1, (right - left) // 2)
+            ay = max(1, (bottom - top) // 2)
+            cv2.ellipse(img_matte, (cx, cy), (ax, ay), 0, 0, 360, 255, -1)
+
+            matte_tensor = self.warp_affine_torch(img_matte, local_IM, roi_shape, device, padding_mode="zeros")
+            matte_tensor[:, :, :1, :] = 0
+            matte_tensor[:, :, -1:, :] = 0
+            matte_tensor[:, :, :, :1] = 0
+            matte_tensor[:, :, :, -1:] = 0
+
+            if face_landmarks is not None:
+                local_landmarks = np.asarray(face_landmarks, dtype=np.float32).copy()
+                local_landmarks[:, 0] -= x0
+                local_landmarks[:, 1] -= y0
+                lm_mask = self.create_landmark_mask(local_landmarks, (roi_shape[0], roi_shape[1], target_img.shape[2]), mask_offsets[4])
+                lm_tensor = self.numpy_to_torch_image(lm_mask, device)
+                matte_tensor = torch.minimum(matte_tensor, lm_tensor)
+
+            matte_tensor = self.blur_area_torch(matte_tensor, mask_offsets[4]).clamp(0.0, 255.0) / 255.0
+            mask_2d_tensor = matte_tensor[0, 0] if self.options.show_face_area_overlay else None
+
+            paste_face_tensor = self.warp_affine_torch(upsk_face, local_IM, roi_shape, device, padding_mode="border")
+            if upsk_face is not fake_face:
+                fake_face_tensor = self.warp_affine_torch(fake_face, local_IM, roi_shape, device, padding_mode="border")
+                paste_face_tensor = paste_face_tensor * float(self.options.blend_ratio) + fake_face_tensor * (1.0 - float(self.options.blend_ratio))
+
+            target_roi = target_img[y0:y1, x0:x1]
+            target_roi_tensor = self.numpy_to_torch_image(target_roi, device)
+            paste_face_tensor = matte_tensor * paste_face_tensor + (1.0 - matte_tensor) * target_roi_tensor
+
+            if self.options.show_face_area_overlay and mask_2d_tensor is not None:
+                overlay_tensor = torch.zeros_like(target_roi_tensor)
+                overlay_tensor[:, 1, :, :] = mask_2d_tensor * 200.0
+                overlay_tensor[:, 2, :, :] = torch.clamp((1.0 - mask_2d_tensor) * mask_2d_tensor * 4.0 * 255.0, 0.0, 255.0)
+                paste_face_tensor = paste_face_tensor * 0.6 + overlay_tensor * 0.4
+
+            target_img[y0:y1, x0:x1] = self.torch_to_numpy_image(paste_face_tensor)
+            return target_img
+
+    def paste_upscale_torch_batch(self, batch_items):
+        device = self.get_gpu_composite_device()
+        if device is None:
+            raise RuntimeError("gpu compositor unavailable")
+        if not batch_items:
+            return []
+        with torch.no_grad():
+            metadata = []
+            matte_sources = []
+            upsk_faces = []
+            fake_faces = []
+            fake_required = False
+            roi_shapes = []
+            for item in batch_items:
+                M_scale = item["target_face"].matrix * item["scale_factor"]
+                IM = cv2.invertAffineTransform(M_scale)
+                upsk_face = item["upsk_face"]
+                fake_face = item["fake_face"]
+                source_height, source_width = upsk_face.shape[:2]
+                source_corners = np.array(
+                    [
+                        [0.0, 0.0],
+                        [float(source_width), 0.0],
+                        [float(source_width), float(source_height)],
+                        [0.0, float(source_height)],
+                    ],
+                    dtype=np.float32,
+                )
+                warped_corners = cv2.transform(source_corners.reshape(1, -1, 2), IM).reshape(-1, 2)
+                min_corner = np.floor(np.min(warped_corners, axis=0)).astype(np.int32)
+                max_corner = np.ceil(np.max(warped_corners, axis=0)).astype(np.int32)
+                roi_width = max_corner[0] - min_corner[0]
+                roi_height = max_corner[1] - min_corner[1]
+                target_box_scale = float(np.sqrt(max(roi_width, 1) * max(roi_height, 1)))
+                blend_px = max(2, int(target_box_scale * float(item["mask_offsets"][4]) / 200))
+                pad = max(4, blend_px + 2)
+                x0 = max(0, int(min_corner[0]) - pad)
+                y0 = max(0, int(min_corner[1]) - pad)
+                x1 = min(item["base_frame"].shape[1], int(max_corner[0]) + pad)
+                y1 = min(item["base_frame"].shape[0], int(max_corner[1]) + pad)
+                if x1 <= x0 or y1 <= y0:
+                    metadata.append(None)
+                    matte_sources.append(None)
+                    upsk_faces.append(None)
+                    fake_faces.append(None)
+                    roi_shapes.append((0, 0))
+                    continue
+
+                local_IM = IM.copy()
+                local_IM[0, 2] -= x0
+                local_IM[1, 2] -= y0
+                roi_shape = (y1 - y0, x1 - x0)
+                roi_shapes.append(roi_shape)
+
+                img_matte = np.zeros((source_height, source_width), dtype=np.uint8)
+                top = int(item["mask_offsets"][0] * source_height)
+                bottom = int(source_height - (item["mask_offsets"][1] * source_height))
+                left = int(item["mask_offsets"][2] * source_width)
+                right = int(source_width - (item["mask_offsets"][3] * source_width))
+                cx = (left + right) // 2
+                cy = (top + bottom) // 2
+                ax = max(1, (right - left) // 2)
+                ay = max(1, (bottom - top) // 2)
+                cv2.ellipse(img_matte, (cx, cy), (ax, ay), 0, 0, 360, 255, -1)
+
+                local_landmarks = None
+                if item["face_landmarks"] is not None:
+                    local_landmarks = np.asarray(item["face_landmarks"], dtype=np.float32).copy()
+                    local_landmarks[:, 0] -= x0
+                    local_landmarks[:, 1] -= y0
+
+                metadata.append(
+                    {
+                        "local_IM": local_IM,
+                        "roi_shape": roi_shape,
+                        "roi_box": (x0, y0, x1, y1),
+                        "mask_offsets": item["mask_offsets"],
+                        "face_landmarks": local_landmarks,
+                        "base_frame": item["base_frame"],
+                        "upsk_is_fake": item["upsk_face"] is item["fake_face"],
+                    }
+                )
+                matte_sources.append(img_matte)
+                upsk_faces.append(upsk_face)
+                fake_faces.append(fake_face)
+                fake_required = fake_required or (item["upsk_face"] is not item["fake_face"])
+
+            valid_entries = [(index, meta) for index, meta in enumerate(metadata) if meta is not None]
+            if not valid_entries:
+                return [item["base_frame"] for item in batch_items]
+
+            valid_indices = [index for index, _meta in valid_entries]
+            valid_metadata = [meta for _index, meta in valid_entries]
+            valid_roi_shapes = [meta["roi_shape"] for meta in valid_metadata]
+            matrix_batch = torch.as_tensor(
+                np.stack([meta["local_IM"] for meta in valid_metadata], axis=0),
+                device=device,
+                dtype=torch.float32,
+            )
+            matte_batch = torch.from_numpy(np.stack([matte_sources[index] for index in valid_indices], axis=0)).to(device=device, dtype=torch.float32).unsqueeze(1)
+            upsk_batch = torch.from_numpy(np.stack([upsk_faces[index] for index in valid_indices], axis=0)).to(device=device, dtype=torch.float32).permute(0, 3, 1, 2)
+            fake_batch = None
+            if fake_required:
+                fake_batch = torch.from_numpy(np.stack([fake_faces[index] for index in valid_indices], axis=0)).to(device=device, dtype=torch.float32).permute(0, 3, 1, 2)
+
+            target_size = int(valid_metadata[0].get("target_size", 512))
+            if upsk_batch.shape[-1] != target_size or upsk_batch.shape[-2] != target_size:
+                upsk_batch = torch_functional.interpolate(upsk_batch, size=(target_size, target_size), mode="bilinear", align_corners=False)
+            if fake_batch is not None and (fake_batch.shape[-1] != target_size or fake_batch.shape[-2] != target_size):
+                fake_batch = torch_functional.interpolate(fake_batch, size=(target_size, target_size), mode="bilinear", align_corners=False)
+
+            matte_warped, _valid_mask = self.warp_affine_torch_batch(matte_batch, matrix_batch, valid_roi_shapes, device, padding_mode="zeros")
+            upsk_warped, _ = self.warp_affine_torch_batch(upsk_batch, matrix_batch, valid_roi_shapes, device, padding_mode="border")
+            fake_warped = None
+            if fake_batch is not None:
+                fake_warped, _ = self.warp_affine_torch_batch(fake_batch, matrix_batch, valid_roi_shapes, device, padding_mode="border")
+
+            for batch_index, metadata_index in enumerate(valid_indices):
+                meta = metadata[metadata_index]
+                roi_height, roi_width = meta["roi_shape"]
+                if roi_height <= 0 or roi_width <= 0:
+                    continue
+                matte_tensor = matte_warped[batch_index : batch_index + 1, :, :roi_height, :roi_width]
+                matte_tensor[:, :, :1, :] = 0
+                matte_tensor[:, :, -1:, :] = 0
+                matte_tensor[:, :, :, :1] = 0
+                matte_tensor[:, :, :, -1:] = 0
+
+                if meta["face_landmarks"] is not None:
+                    lm_mask = self.create_landmark_mask(
+                        meta["face_landmarks"],
+                        (roi_height, roi_width, meta["base_frame"].shape[2]),
+                        meta["mask_offsets"][4],
+                    )
+                    lm_tensor = self.numpy_to_torch_image(lm_mask, device)
+                    matte_tensor = torch.minimum(matte_tensor, lm_tensor)
+
+                matte_tensor = self.blur_area_torch(matte_tensor, meta["mask_offsets"][4]).clamp(0.0, 255.0) / 255.0
+                mask_2d_tensor = matte_tensor[0, 0] if self.options.show_face_area_overlay else None
+                paste_face_tensor = upsk_warped[batch_index : batch_index + 1, :, :roi_height, :roi_width]
+                if fake_warped is not None and not meta["upsk_is_fake"]:
+                    fake_face_tensor = fake_warped[batch_index : batch_index + 1, :, :roi_height, :roi_width]
+                    paste_face_tensor = paste_face_tensor * float(self.options.blend_ratio) + fake_face_tensor * (1.0 - float(self.options.blend_ratio))
+
+                x0, y0, x1, y1 = meta["roi_box"]
+                target_roi = meta["base_frame"][y0:y1, x0:x1]
+                target_roi_tensor = self.numpy_to_torch_image(target_roi, device)
+                paste_face_tensor = matte_tensor * paste_face_tensor + (1.0 - matte_tensor) * target_roi_tensor
+
+                if self.options.show_face_area_overlay and mask_2d_tensor is not None:
+                    overlay_tensor = torch.zeros_like(target_roi_tensor)
+                    overlay_tensor[:, 1, :, :] = mask_2d_tensor * 200.0
+                    overlay_tensor[:, 2, :, :] = torch.clamp((1.0 - mask_2d_tensor) * mask_2d_tensor * 4.0 * 255.0, 0.0, 255.0)
+                    paste_face_tensor = paste_face_tensor * 0.6 + overlay_tensor * 0.4
+
+                meta["base_frame"][y0:y1, x0:x1] = self.torch_to_numpy_image(paste_face_tensor)
+
+        return [item["base_frame"] for item in batch_items]
+
 
     def paste_upscale(self, fake_face, upsk_face, M, target_img, scale_factor, mask_offsets, face_landmarks=None):
+        if self.should_use_gpu_compositor():
+            try:
+                result = self.paste_upscale_torch(fake_face, upsk_face, M, target_img, scale_factor, mask_offsets, face_landmarks=face_landmarks)
+                if result is not None:
+                    return result
+            except Exception:
+                pass
         M_scale = M * scale_factor
         IM = cv2.invertAffineTransform(M_scale)
 
-        img_matte = np.zeros((upsk_face.shape[0], upsk_face.shape[1]), dtype=np.uint8)
+        source_height, source_width = upsk_face.shape[:2]
+        source_corners = np.array(
+            [
+                [0.0, 0.0],
+                [float(source_width), 0.0],
+                [float(source_width), float(source_height)],
+                [0.0, float(source_height)],
+            ],
+            dtype=np.float32,
+        )
+        warped_corners = cv2.transform(source_corners.reshape(1, -1, 2), IM).reshape(-1, 2)
+        min_corner = np.floor(np.min(warped_corners, axis=0)).astype(np.int32)
+        max_corner = np.ceil(np.max(warped_corners, axis=0)).astype(np.int32)
+        roi_width = max_corner[0] - min_corner[0]
+        roi_height = max_corner[1] - min_corner[1]
+        target_box_scale = float(np.sqrt(max(roi_width, 1) * max(roi_height, 1)))
+        blend_px = max(2, int(target_box_scale * float(mask_offsets[4]) / 200))
+        pad = max(4, blend_px + 2)
+        x0 = max(0, int(min_corner[0]) - pad)
+        y0 = max(0, int(min_corner[1]) - pad)
+        x1 = min(target_img.shape[1], int(max_corner[0]) + pad)
+        y1 = min(target_img.shape[0], int(max_corner[1]) + pad)
+        if x1 <= x0 or y1 <= y0:
+            return target_img
+
+        local_IM = IM.copy()
+        local_IM[0, 2] -= x0
+        local_IM[1, 2] -= y0
+        roi_shape = (y1 - y0, x1 - x0)
+
+        img_matte = np.zeros((source_height, source_width), dtype=np.uint8)
 
         w = img_matte.shape[1]
         h = img_matte.shape[0]
@@ -1371,14 +1906,17 @@ class ProcessMgr():
         ay = max(1, (bottom - top) // 2)
         cv2.ellipse(img_matte, (cx, cy), (ax, ay), 0, 0, 360, 255, -1)
 
-        img_matte = cv2.warpAffine(img_matte, IM, (target_img.shape[1], target_img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
+        img_matte = cv2.warpAffine(img_matte, local_IM, (roi_shape[1], roi_shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
         img_matte[:1, :] = img_matte[-1:, :] = img_matte[:, :1] = img_matte[:, -1:] = 0
 
         # Constrain mask to actual face outline using landmark convex hull.
         # For angled/profile faces this prevents the warped ellipse from covering
         # background regions where the swap model put grey fill pixels.
         if face_landmarks is not None:
-            lm_mask = self.create_landmark_mask(face_landmarks, target_img.shape, mask_offsets[4])
+            local_landmarks = np.asarray(face_landmarks, dtype=np.float32).copy()
+            local_landmarks[:, 0] -= x0
+            local_landmarks[:, 1] -= y0
+            lm_mask = self.create_landmark_mask(local_landmarks, (roi_shape[0], roi_shape[1], target_img.shape[2]), mask_offsets[4])
             img_matte = np.minimum(img_matte, lm_mask)
 
         img_matte = self.blur_area(img_matte, mask_offsets[4])
@@ -1388,24 +1926,25 @@ class ProcessMgr():
         mask_2d = img_matte if self.options.show_face_area_overlay else None
 
         img_matte = np.reshape(img_matte, [img_matte.shape[0], img_matte.shape[1], 1])
-        paste_face = cv2.warpAffine(upsk_face, IM, (target_img.shape[1], target_img.shape[0]), borderMode=cv2.BORDER_REPLICATE)
+        paste_face = cv2.warpAffine(upsk_face, local_IM, (roi_shape[1], roi_shape[0]), borderMode=cv2.BORDER_REPLICATE)
         if upsk_face is not fake_face:
-            fake_face = cv2.warpAffine(fake_face, IM, (target_img.shape[1], target_img.shape[0]), borderMode=cv2.BORDER_REPLICATE)
+            fake_face = cv2.warpAffine(fake_face, local_IM, (roi_shape[1], roi_shape[0]), borderMode=cv2.BORDER_REPLICATE)
             paste_face = cv2.addWeighted(paste_face, self.options.blend_ratio, fake_face, 1.0 - self.options.blend_ratio, 0)
 
+        target_roi = target_img[y0:y1, x0:x1]
         paste_face = img_matte * paste_face
-        paste_face = paste_face + (1 - img_matte) * target_img.astype(np.float32)
+        paste_face = paste_face + (1 - img_matte) * target_roi.astype(np.float32)
 
         if self.options.show_face_area_overlay:
             # Gradient overlay: green in the core (mask ~ 1), yellow/orange at the
             # edge blend zone (mask ~ 0.5), invisible outside (mask ~ 0).
             # G channel scales with mask strength; R channel peaks mid-transition.
-            overlay = np.zeros_like(target_img, dtype=np.uint8)
+            overlay = np.zeros_like(target_roi, dtype=np.uint8)
             overlay[:, :, 1] = (mask_2d * 200).astype(np.uint8)
             overlay[:, :, 2] = np.clip((1.0 - mask_2d) * mask_2d * 4 * 255, 0, 255).astype(np.uint8)
             paste_face = cv2.addWeighted(paste_face.astype(np.uint8), 0.6, overlay, 0.4, 0)
-
-        return paste_face.astype(np.uint8)
+        target_img[y0:y1, x0:x1] = paste_face.astype(np.uint8)
+        return target_img
 
 
     def blur_area(self, img_matte, face_mask_blend):
@@ -1640,6 +2179,10 @@ class ProcessMgr():
         for p in self.processors:
             p.Release()
         self.processors.clear()
+        self.gpu_composite_enabled = None
+        self.gpu_composite_device = None
+        self.gpu_composite_grid_cache.clear()
+        self.gpu_composite_kernel_cache.clear()
         # FIX: Null out writer references after closing so GC can collect them
         if self.videowriter is not None:
             self.videowriter.close()
