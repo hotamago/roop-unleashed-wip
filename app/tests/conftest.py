@@ -20,6 +20,8 @@ def reset_runtime_globals(monkeypatch):
         detect_pack_frame_count=256,
         staged_chunk_size=96,
         prefetch_frames=24,
+        detect_batch_size=8,
+        detect_single_batch_workers=1,
         swap_batch_size=32,
         mask_batch_size=64,
         enhance_batch_size=8,

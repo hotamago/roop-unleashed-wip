@@ -166,6 +166,8 @@ def settings_tab():
                 staged_chunk_size = gr.Slider(8, 480, value=roop.config.globals.CFG.staged_chunk_size, label="Staged Chunk Size", info='Frames scheduled per staged chunk', step=1.0, interactive=True)
                 prefetch_frames = gr.Slider(1, 256, value=roop.config.globals.CFG.prefetch_frames, label="Prefetch Frames", info='Bounded decode queue size for staged reads', step=1.0, interactive=True)
                 detect_pack_frame_count = gr.Slider(8, 1024, value=roop.config.globals.CFG.detect_pack_frame_count, label="Detect Pack Frame Count", info='Packed detect metadata frames per cache blob', step=8.0, interactive=True)
+                detect_batch_size = gr.Slider(1, 128, value=getattr(roop.config.globals.CFG, "detect_batch_size", 8), label="Detect Batch Size", info='Requested detector batch size when the selected detector model supports batched inference.', step=1.0, interactive=True)
+                detect_single_batch_workers = gr.Slider(1, 8, value=getattr(roop.config.globals.CFG, "detect_single_batch_workers", 1), label="Detect Single-Batch Workers", info='Parallel detector worker sessions used when the selected detector model only supports batch=1.', step=1.0, interactive=True)
                 single_batch_workers = gr.Slider(1, 8, value=roop.config.globals.CFG.single_batch_workers, label="Single-Batch Workers", info='Parallel worker sessions for models limited to batch=1. GPU runtime is capped to 1 worker to avoid session/VRAM thrash.', step=1.0, interactive=True)
                 settings_controls.append(gr.Dropdown(image_formats, label="Image Output Format", info='default: png', value=roop.config.globals.CFG.output_image_format, elem_id='output_image_format', interactive=True))
             with gr.Column():
@@ -219,6 +221,8 @@ def settings_tab():
     staged_chunk_size.input(fn=lambda a,b='staged_chunk_size':on_settings_changed_misc(a,b), inputs=[staged_chunk_size], outputs=[memory_status])
     prefetch_frames.input(fn=lambda a,b='prefetch_frames':on_settings_changed_misc(a,b), inputs=[prefetch_frames], outputs=[memory_status])
     detect_pack_frame_count.input(fn=lambda a,b='detect_pack_frame_count':on_settings_changed_misc(a,b), inputs=[detect_pack_frame_count], outputs=[memory_status])
+    detect_batch_size.input(fn=lambda a,b='detect_batch_size':on_settings_changed_misc(a,b), inputs=[detect_batch_size], outputs=[memory_status])
+    detect_single_batch_workers.input(fn=lambda a,b='detect_single_batch_workers':on_settings_changed_misc(a,b), inputs=[detect_single_batch_workers], outputs=[memory_status])
     single_batch_workers.input(fn=lambda a,b='single_batch_workers':on_settings_changed_misc(a,b), inputs=[single_batch_workers], outputs=[memory_status])
     swap_batch_size.input(fn=lambda a,b='swap_batch_size':on_settings_changed_misc(a,b), inputs=[swap_batch_size], outputs=[memory_status])
     mask_batch_size.input(fn=lambda a,b='mask_batch_size':on_settings_changed_misc(a,b), inputs=[mask_batch_size], outputs=[memory_status])
@@ -286,6 +290,8 @@ def on_settings_changed_misc(new_val, attribname):
             'staged_chunk_size',
             'prefetch_frames',
             'detect_pack_frame_count',
+            'detect_batch_size',
+            'detect_single_batch_workers',
             'single_batch_workers',
             'swap_batch_size',
             'mask_batch_size',

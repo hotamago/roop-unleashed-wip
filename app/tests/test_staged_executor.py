@@ -119,6 +119,50 @@ def test_ensure_full_detect_stage_resumes_partial_pack(tmp_path, monkeypatch):
     assert pack_data["frames"][3]["frame_number"] == 3
 
 
+def test_ensure_full_detect_stage_uses_batched_frame_plans_when_available(tmp_path, monkeypatch):
+    executor = StagedBatchExecutor("File", None, make_options({}))
+    entry = ProcessEntry("clip.mp4", 0, 4, 30.0)
+    detect_dir = tmp_path / "detect"
+    stages = {"detect": False}
+    manifest = {}
+    memory_plan = {
+        "prefetch_frames": 2,
+        "detect_batch_size": 3,
+        "detect_single_batch_workers": 2,
+    }
+    captured = {}
+
+    class FakePlanner:
+        def __init__(self, _progress):
+            return None
+
+        def initialize(self, *_args, **_kwargs):
+            return None
+
+        def build_frame_plans(self, frames, detect_batch_size=1, detect_single_batch_workers=1):
+            captured.setdefault("calls", []).append((len(frames), detect_batch_size, detect_single_batch_workers))
+            return [{"fallback": True, "tasks": []} for _frame in frames]
+
+        def release_resources(self):
+            return None
+
+    def fake_iter_video_chunk(_video_path, frame_start, frame_end, prefetch_frames):
+        captured.setdefault("iter_calls", []).append((frame_start, frame_end, prefetch_frames))
+        for frame_number in range(frame_start, frame_end):
+            yield frame_number, np.zeros((2, 2, 3), dtype=np.uint8)
+
+    monkeypatch.setattr("roop.pipeline.staged_executor.detect_stage.ProcessMgr", FakePlanner)
+    monkeypatch.setattr("roop.pipeline.staged_executor.detect_stage.iter_video_chunk", fake_iter_video_chunk)
+    monkeypatch.setattr(executor, "get_detect_pack_frame_count", lambda: 4)
+    monkeypatch.setattr(executor, "update_progress", lambda *args, **kwargs: None)
+
+    task_count = executor.ensure_full_detect_stage(entry, 4, detect_dir, stages, manifest, memory_plan)
+
+    assert task_count == 0
+    assert captured["iter_calls"] == [(0, 4, 2)]
+    assert captured["calls"] == [(4, 3, 2)]
+
+
 def test_ensure_enhance_stage_flushes_cache_once_per_chunk(tmp_path, monkeypatch):
     executor = StagedBatchExecutor("File", None, make_options({"faceswap": {}, "gfpgan": {}}))
     chunk_dir = tmp_path / "chunk"

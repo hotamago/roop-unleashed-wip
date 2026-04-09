@@ -6,7 +6,7 @@ import time
 
 from roop.pipeline.options import ProcessOptions
 
-from roop.face import align_crop, get_first_face, get_all_faces, rotate_anticlockwise, rotate_clockwise, clamp_cut_values
+from roop.face import align_crop, get_face_analyser, get_first_face, get_all_faces, rotate_anticlockwise, rotate_clockwise, clamp_cut_values
 from roop.utils import compute_cosine_distance, get_device, str_to_class
 from roop.memory import resolve_single_batch_workers
 from roop.face_swap_models import (
@@ -308,6 +308,55 @@ class ProcessMgr():
             return []
         return tasks
 
+    def get_frame_face_targets_from_faces(self, frame: Frame, faces):
+        if faces is None:
+            return self.get_frame_face_targets(frame)
+        tasks = []
+        selected_input_index = self._get_selected_input_index()
+        if self.options.swap_mode == "first":
+            if not faces or selected_input_index is None:
+                return tasks
+            tasks.append((selected_input_index, min(faces, key=lambda x: x.bbox[0])))
+            return tasks
+
+        if not faces:
+            return tasks
+
+        if self.options.swap_mode == "all":
+            for face in faces:
+                if selected_input_index is None:
+                    break
+                tasks.append((selected_input_index, face))
+        elif self.options.swap_mode == "all_input":
+            for i, face in enumerate(faces):
+                if i >= len(self.input_face_datas):
+                    break
+                tasks.append((i, face))
+        elif self.options.swap_mode == "selected":
+            num_targetfaces = len(self.target_face_datas)
+            use_index = num_targetfaces == 1
+            if use_index and selected_input_index is None:
+                return tasks
+            for i, tf in enumerate(self.target_face_datas):
+                for face in faces:
+                    if compute_cosine_distance(tf.embedding, face.embedding) <= self.options.face_distance_threshold:
+                        if i < len(self.input_face_datas):
+                            input_index = selected_input_index if use_index else i
+                            tasks.append((input_index, face))
+                        if not roop.config.globals.vr_mode and len(tasks) == num_targetfaces:
+                            break
+        elif self.options.swap_mode == "all_female" or self.options.swap_mode == "all_male":
+            gender = 'F' if self.options.swap_mode == "all_female" else 'M'
+            for face in faces:
+                if face.sex == gender:
+                    if selected_input_index is None:
+                        break
+                    tasks.append((selected_input_index, face))
+
+        if roop.config.globals.vr_mode and len(tasks) % 2 > 0:
+            return []
+        return tasks
+
 
     def prepare_face_task(self, face_index, target_face: Face, frame: Frame):
         inputface = self.input_face_datas[face_index].faces[0] if len(self.input_face_datas) > face_index else None
@@ -360,6 +409,36 @@ class ProcessMgr():
             fallback_required = True
             tasks = []
         return {"tasks": tasks, "fallback": fallback_required}
+
+    def build_frame_plan_from_faces(self, frame: Frame, faces):
+        selected_faces = self.get_frame_face_targets_from_faces(frame, faces)
+        tasks = [self.prepare_face_task(face_index, face, frame) for face_index, face in selected_faces]
+        fallback_required = len(tasks) == 0
+        if roop.config.globals.no_face_action == eNoFaceAction.SKIP_FRAME_IF_DISSIMILAR and 0 < len(tasks) < len(self.input_face_datas):
+            fallback_required = True
+            tasks = []
+        return {"tasks": tasks, "fallback": fallback_required}
+
+    def build_frame_plans(self, frames, detect_batch_size=1, detect_single_batch_workers=1):
+        frames = list(frames or [])
+        if not frames:
+            return []
+        analyser = get_face_analyser()
+        get_many = getattr(analyser, "get_many", None)
+        if callable(get_many):
+            faces_per_frame = get_many(
+                frames,
+                batch_size=max(1, int(detect_batch_size)),
+                worker_count=max(1, int(detect_single_batch_workers)),
+            )
+        else:
+            faces_per_frame = [None] * len(frames)
+        if len(faces_per_frame) < len(frames):
+            faces_per_frame = list(faces_per_frame) + [None] * (len(frames) - len(faces_per_frame))
+        return [
+            self.build_frame_plan_from_faces(frame, faces)
+            for frame, faces in zip(frames, faces_per_frame)
+        ]
 
 
     def get_swap_model_output_size(self, processor=None):

@@ -82,6 +82,104 @@ def test_hybrid_face_analyser_custom_detector_preserves_compatibility_landmarks(
     assert faces[0].kps.shape == (5, 2)
 
 
+def test_hybrid_face_analyser_uses_detector_batch_when_available(monkeypatch):
+    calls = []
+
+    class FakeBatchDetector:
+        supports_batch = True
+        batch_size_limit = None
+        supports_parallel_single_batch = False
+
+        def detect(self, _frame, max_num=0):
+            raise AssertionError("single detect should not be used when batch is available")
+
+        def detect_batch(self, frames, max_num=0, batch_size=1):
+            calls.append((len(frames), max_num, batch_size))
+            return [
+                (
+                    np.array([[1.0, 2.0, 11.0, 12.0, 0.9]], dtype=np.float32),
+                    np.array([[[2.0, 3.0], [5.0, 3.0], [3.5, 5.0], [2.5, 8.0], [5.5, 8.0]]], dtype=np.float32),
+                )
+                for _frame in frames
+            ]
+
+    compat_analyser = SimpleNamespace(models={})
+
+    monkeypatch.setattr("roop.face.analyser.create_face_detector", lambda *args, **kwargs: FakeBatchDetector())
+    monkeypatch.setattr("roop.face.analyser.create_face_landmarker", lambda *args, **kwargs: None)
+
+    analyser = HybridFaceAnalyser(
+        compat_analyser,
+        "yolo_face",
+        "insightface_2d106",
+        ["CPUExecutionProvider"],
+        (640, 640),
+    )
+
+    faces_per_frame = analyser.get_many(
+        [
+            np.zeros((16, 16, 3), dtype=np.uint8),
+            np.zeros((16, 16, 3), dtype=np.uint8),
+        ],
+        batch_size=4,
+    )
+
+    assert calls == [(2, 0, 4)]
+    assert len(faces_per_frame) == 2
+    assert all(len(faces) == 1 for faces in faces_per_frame)
+
+
+def test_hybrid_face_analyser_parallelizes_single_batch_detector_workers(monkeypatch):
+    calls = []
+
+    class FakeSingleBatchDetector:
+        supports_batch = False
+        batch_size_limit = 1
+        supports_parallel_single_batch = True
+
+        def __init__(self, worker_id=0):
+            self.worker_id = worker_id
+
+        def detect(self, _frame, max_num=0):
+            calls.append((self.worker_id, max_num))
+            return (
+                np.array([[1.0, 2.0, 11.0, 12.0, 0.9]], dtype=np.float32),
+                np.array([[[2.0, 3.0], [5.0, 3.0], [3.5, 5.0], [2.5, 8.0], [5.5, 8.0]]], dtype=np.float32),
+            )
+
+        def CreateWorkerDetector(self):
+            return FakeSingleBatchDetector(worker_id=self.worker_id + 1)
+
+        def Release(self):
+            return None
+
+    compat_analyser = SimpleNamespace(models={})
+
+    monkeypatch.setattr("roop.face.analyser.create_face_detector", lambda *args, **kwargs: FakeSingleBatchDetector())
+    monkeypatch.setattr("roop.face.analyser.create_face_landmarker", lambda *args, **kwargs: None)
+
+    analyser = HybridFaceAnalyser(
+        compat_analyser,
+        "yolo_face",
+        "insightface_2d106",
+        ["CPUExecutionProvider"],
+        (640, 640),
+    )
+
+    faces_per_frame = analyser.get_many(
+        [
+            np.zeros((16, 16, 3), dtype=np.uint8),
+            np.zeros((16, 16, 3), dtype=np.uint8),
+            np.zeros((16, 16, 3), dtype=np.uint8),
+        ],
+        worker_count=2,
+    )
+
+    assert len(faces_per_frame) == 3
+    assert len(calls) == 3
+    assert len(analyser.get_detector_worker_instances(2)) == 2
+
+
 def test_create_face_analyser_skips_faceanalysis_wrapper_for_custom_detector(monkeypatch):
     captured = {}
     roop.config.globals.CFG = SimpleNamespace(
@@ -145,6 +243,39 @@ def test_yolo_face_detector_keeps_bgr_channel_order(monkeypatch):
 
     observed = captured["input"][0, :, 0, 0]
     assert np.allclose(observed, np.array([10.0, 20.0, 30.0], dtype=np.float32) / 255.0)
+
+
+def test_yolo_face_detector_detect_batch_preserves_batch_dimension(monkeypatch):
+    captured = {}
+
+    class FakeSession:
+        def get_inputs(self):
+            return [SimpleNamespace(name="input", shape=[None, 3, 640, 640])]
+
+        def run(self, _outputs, inputs):
+            captured["input_shape"] = inputs["input"].shape
+            return [np.zeros((2, 20, 8400), dtype=np.float32)]
+
+    monkeypatch.setattr(
+        "roop.face.analytics_runtime.create_inference_session",
+        lambda *_args, **_kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(
+        "roop.face.analytics_runtime.get_face_detector_model_paths",
+        lambda *_args, **_kwargs: ["fake_yolo.onnx"],
+    )
+
+    detector = YoloFaceDetector("yolo_face", ["CPUExecutionProvider"], (640, 640))
+    outputs = detector.detect_batch(
+        [
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            np.zeros((4, 4, 3), dtype=np.uint8),
+        ],
+        batch_size=4,
+    )
+
+    assert captured["input_shape"] == (2, 3, 640, 640)
+    assert len(outputs) == 2
 
 
 def test_fan_68_5_landmarker_normalizes_points_before_inference(monkeypatch):

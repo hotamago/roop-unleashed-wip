@@ -1,5 +1,6 @@
 import threading
 from contextlib import contextmanager
+from queue import Queue
 from types import SimpleNamespace
 from typing import Any
 
@@ -44,6 +45,7 @@ class HybridFaceAnalyser:
         self.det_size = tuple(det_size)
         self.detector = create_face_detector(self.detector_model, self.providers, self.det_size)
         self.landmarker = create_face_landmarker(self.landmarker_model, self.providers)
+        self.detector_worker_pools = {}
 
     def get(self, frame, max_num=0):
         if self.detector is None:
@@ -71,6 +73,146 @@ class HybridFaceAnalyser:
             self._normalize_face_vectors(face)
             faces.append(face)
         return self._enrich_faces(frame, faces)
+
+    def _create_faces_from_detection(self, frame, detections, kpss):
+        if detections is None or detections.shape[0] == 0:
+            return []
+        faces = []
+        for index, detection in enumerate(detections):
+            kps = None
+            if kpss is not None and index < len(kpss):
+                kps = np.asarray(kpss[index], dtype=np.float32)
+            face = Face(
+                bbox=np.asarray(detection[:4], dtype=np.float32),
+                kps=kps,
+                det_score=float(detection[4]),
+            )
+            for task_name, model in self.compat_analyser.models.items():
+                if task_name == "detection":
+                    continue
+                model.get(frame, face)
+            self._normalize_face_vectors(face)
+            faces.append(face)
+        return faces
+
+    def should_parallelize_single_batch_detector(self) -> bool:
+        return bool(
+            self.detector is not None
+            and getattr(self.detector, "supports_parallel_single_batch", False)
+            and getattr(self.detector, "batch_size_limit", None) == 1
+            and hasattr(self.detector, "CreateWorkerDetector")
+        )
+
+    def get_detector_worker_count(self, worker_count=None) -> int:
+        if not self.should_parallelize_single_batch_detector():
+            return 1
+        if worker_count is None:
+            worker_count = getattr(getattr(roop.config.globals, "CFG", None), "detect_single_batch_workers", 1)
+        try:
+            return max(1, int(worker_count))
+        except (TypeError, ValueError):
+            return 1
+
+    def get_detector_worker_instances(self, worker_count: int):
+        worker_count = max(1, int(worker_count))
+        pool_key = id(self.detector)
+        pool = self.detector_worker_pools.get(pool_key)
+        if pool is None or pool.get("base") is not self.detector:
+            pool = {
+                "base": self.detector,
+                "workers": [self.detector],
+            }
+            self.detector_worker_pools[pool_key] = pool
+        workers = pool["workers"]
+        while len(workers) < worker_count:
+            workers.append(self.detector.CreateWorkerDetector())
+        while len(workers) > worker_count:
+            extra_worker = workers.pop()
+            if extra_worker is not self.detector:
+                try:
+                    extra_worker.Release()
+                except Exception:
+                    pass
+        return list(workers)
+
+    def release(self):
+        for pool in self.detector_worker_pools.values():
+            workers = pool.get("workers", [])
+            for worker in workers[1:]:
+                try:
+                    worker.Release()
+                except Exception:
+                    pass
+        self.detector_worker_pools.clear()
+
+    def get_many(self, frames, max_num=0, batch_size=1, worker_count=1):
+        frames = list(frames or [])
+        if not frames:
+            return []
+        if self.detector is None:
+            return [self.get(frame, max_num=max_num) for frame in frames]
+
+        if getattr(self.detector, "supports_batch", False):
+            detected_faces = []
+            batch_outputs = self.detector.detect_batch(frames, max_num=max_num, batch_size=batch_size)
+            for frame, (detections, kpss) in zip(frames, batch_outputs):
+                detected_faces.append(self._enrich_faces(frame, self._create_faces_from_detection(frame, detections, kpss)))
+            return detected_faces
+
+        configured_worker_count = self.get_detector_worker_count(worker_count)
+        if configured_worker_count <= 1 or len(frames) <= 1:
+            return [self.get(frame, max_num=max_num) for frame in frames]
+
+        workers = self.get_detector_worker_instances(configured_worker_count)
+        active_workers = workers[: min(len(frames), configured_worker_count)]
+        task_queue = Queue(maxsize=max(len(active_workers) * 2, 2))
+        detection_outputs = [None] * len(frames)
+        output_lock = threading.Lock()
+        worker_error = {"exc": None}
+
+        def worker_loop(worker_detector):
+            while True:
+                item = task_queue.get()
+                try:
+                    if item is None:
+                        return
+                    if worker_error["exc"] is not None:
+                        continue
+                    index, frame = item
+                    detections, kpss = worker_detector.detect(frame, max_num=max_num)
+                    with output_lock:
+                        detection_outputs[index] = (detections, kpss)
+                except Exception as exc:
+                    with output_lock:
+                        if worker_error["exc"] is None:
+                            worker_error["exc"] = exc
+                finally:
+                    task_queue.task_done()
+
+        worker_threads = [
+            threading.Thread(target=worker_loop, args=(worker_detector,), daemon=True)
+            for worker_detector in active_workers
+        ]
+        for worker_thread in worker_threads:
+            worker_thread.start()
+        for index, frame in enumerate(frames):
+            task_queue.put((index, frame), block=True)
+        for _ in worker_threads:
+            task_queue.put(None, block=True)
+        task_queue.join()
+        for worker_thread in worker_threads:
+            worker_thread.join()
+        if worker_error["exc"] is not None:
+            raise worker_error["exc"]
+        outputs = []
+        for frame, detection_output in zip(frames, detection_outputs):
+            if detection_output is None:
+                outputs.append([])
+                continue
+            detections, kpss = detection_output
+            faces = self._create_faces_from_detection(frame, detections, kpss)
+            outputs.append(self._enrich_faces(frame, faces))
+        return outputs
 
     def _enrich_faces(self, frame, faces):
         if self.landmarker is None:
@@ -188,6 +330,9 @@ def release_face_analyser():
     global FACE_ANALYSER, FACE_ANALYSER_SIGNATURE
     with THREAD_LOCK_ANALYSER:
         if FACE_ANALYSER is not None:
+            release = getattr(FACE_ANALYSER, "release", None)
+            if callable(release):
+                release()
             del FACE_ANALYSER
             FACE_ANALYSER = None
         FACE_ANALYSER_SIGNATURE = None

@@ -86,6 +86,70 @@ def iter_full_source_frames_with_meta(executor, entry, endframe, detect_dir, fra
         yield seq_index, frame_number, frame, frame_meta
 
 
+def resolve_detect_window_size(memory_plan):
+    detect_batch_size = max(1, int(memory_plan.get("detect_batch_size", 1)))
+    detect_single_batch_workers = max(1, int(memory_plan.get("detect_single_batch_workers", 1)))
+    return max(detect_batch_size, detect_single_batch_workers * 2)
+
+
+def build_detect_frame_plans(planner, frames, memory_plan):
+    build_many = getattr(planner, "build_frame_plans", None)
+    if callable(build_many):
+        return build_many(
+            frames,
+            detect_batch_size=max(1, int(memory_plan.get("detect_batch_size", 1))),
+            detect_single_batch_workers=max(1, int(memory_plan.get("detect_single_batch_workers", 1))),
+        )
+    return [planner.build_frame_plan(frame) for frame in frames]
+
+
+def append_detect_window_frames(
+    executor,
+    planner,
+    window_items,
+    pack_frames,
+    pack_path,
+    pack_data,
+    entry,
+    frame_count,
+    processed_frames,
+    total_tasks,
+    frames_since_checkpoint,
+    checkpoint_interval,
+    memory_plan,
+):
+    if not window_items:
+        return processed_frames, total_tasks, frames_since_checkpoint
+    frame_plans = build_detect_frame_plans(planner, [frame for _, _, frame in window_items], memory_plan)
+    for (seq_index, frame_number, _frame), frame_plan in zip(window_items, frame_plans):
+        frame_meta = {
+            "frame_number": frame_number,
+            "sequence": seq_index,
+            "fallback": frame_plan["fallback"],
+            "tasks": [],
+        }
+        for task_index, task in enumerate(frame_plan["tasks"]):
+            cache_key = f"f{seq_index:06d}_t{task_index:03d}"
+            task_meta = {key: value for key, value in task.items() if key != "aligned_frame"}
+            task_meta["cache_key"] = cache_key
+            frame_meta["tasks"].append(task_meta)
+        pack_frames.append(frame_meta)
+        total_tasks += len(frame_meta["tasks"])
+        processed_frames += 1
+        frames_since_checkpoint += 1
+        executor.update_progress(
+            "detect",
+            detail="Streaming source decode + packed face detection",
+            step_completed=processed_frames,
+            step_total=frame_count,
+            step_unit="frames",
+        )
+        if frames_since_checkpoint >= checkpoint_interval:
+            write_cache_blob(pack_path, pack_data)
+            frames_since_checkpoint = 0
+    return processed_frames, total_tasks, frames_since_checkpoint
+
+
 def ensure_full_detect_stage(executor, entry, endframe, detect_dir, stages, manifest, memory_plan):
     plans_dir = executor.get_detect_pack_dir(detect_dir)
     plans_dir.mkdir(parents=True, exist_ok=True)
@@ -147,34 +211,44 @@ def ensure_full_detect_stage(executor, entry, endframe, detect_dir, stages, mani
             absolute_start = entry.startframe + next_sequence - 1
             absolute_end = entry.startframe + pack_end
             frames_since_checkpoint = 0
+            frame_window = []
+            detect_window_size = resolve_detect_window_size(memory_plan)
             for frame_number, frame in iter_video_chunk(entry.filename, absolute_start, absolute_end, memory_plan["prefetch_frames"]):
                 seq_index = (frame_number - entry.startframe) + 1
-                frame_plan = planner.build_frame_plan(frame)
-                frame_meta = {
-                    "frame_number": frame_number,
-                    "sequence": seq_index,
-                    "fallback": frame_plan["fallback"],
-                    "tasks": [],
-                }
-                for task_index, task in enumerate(frame_plan["tasks"]):
-                    cache_key = f"f{seq_index:06d}_t{task_index:03d}"
-                    task_meta = {key: value for key, value in task.items() if key != "aligned_frame"}
-                    task_meta["cache_key"] = cache_key
-                    frame_meta["tasks"].append(task_meta)
-                pack_frames.append(frame_meta)
-                total_tasks += len(frame_meta["tasks"])
-                processed_frames += 1
-                frames_since_checkpoint += 1
-                executor.update_progress(
-                    "detect",
-                    detail="Streaming source decode + packed face detection",
-                    step_completed=processed_frames,
-                    step_total=frame_count,
-                    step_unit="frames",
+                frame_window.append((seq_index, frame_number, frame))
+                if len(frame_window) >= detect_window_size:
+                    processed_frames, total_tasks, frames_since_checkpoint = append_detect_window_frames(
+                        executor,
+                        planner,
+                        frame_window,
+                        pack_frames,
+                        pack_path,
+                        pack_data,
+                        entry,
+                        frame_count,
+                        processed_frames,
+                        total_tasks,
+                        frames_since_checkpoint,
+                        checkpoint_interval,
+                        memory_plan,
+                    )
+                    frame_window = []
+            if frame_window:
+                processed_frames, total_tasks, frames_since_checkpoint = append_detect_window_frames(
+                    executor,
+                    planner,
+                    frame_window,
+                    pack_frames,
+                    pack_path,
+                    pack_data,
+                    entry,
+                    frame_count,
+                    processed_frames,
+                    total_tasks,
+                    frames_since_checkpoint,
+                    checkpoint_interval,
+                    memory_plan,
                 )
-                if frames_since_checkpoint >= checkpoint_interval:
-                    write_cache_blob(pack_path, pack_data)
-                    frames_since_checkpoint = 0
             if pack_frames:
                 write_cache_blob(pack_path, pack_data)
             manifest["frame_count"] = processed_frames
@@ -228,17 +302,37 @@ def ensure_chunk_detect(executor, video_path, chunk_dir, chunk_start, chunk_end,
     processed_frames = 0
     total_frames = max(chunk_end - chunk_start, 1)
     try:
+        frame_window = []
+        detect_window_size = resolve_detect_window_size(memory_plan)
         for frame_number, frame in iter_video_chunk(video_path, chunk_start, chunk_end, memory_plan["prefetch_frames"]):
-            frame_plan = planner.build_frame_plan(frame)
-            frame_meta = {"frame_number": frame_number, "fallback": frame_plan["fallback"], "tasks": []}
-            for task_index, task in enumerate(frame_plan["tasks"]):
-                cache_key = f"f{frame_number:08d}_t{task_index:03d}"
-                task_meta = {key: value for key, value in task.items() if key != "aligned_frame"}
-                task_meta["cache_key"] = cache_key
-                frame_meta["tasks"].append(task_meta)
-            chunk_meta["frames"].append(frame_meta)
-            processed_frames += 1
-            executor.update_progress("detect", detail="Detecting and aligning faces", step_completed=processed_frames, step_total=total_frames, step_unit="frames")
+            frame_window.append((frame_number, frame))
+            if len(frame_window) >= detect_window_size:
+                frame_numbers = [item[0] for item in frame_window]
+                frame_plans = build_detect_frame_plans(planner, [item[1] for item in frame_window], memory_plan)
+                for current_frame_number, frame_plan in zip(frame_numbers, frame_plans):
+                    frame_meta = {"frame_number": current_frame_number, "fallback": frame_plan["fallback"], "tasks": []}
+                    for task_index, task in enumerate(frame_plan["tasks"]):
+                        cache_key = f"f{current_frame_number:08d}_t{task_index:03d}"
+                        task_meta = {key: value for key, value in task.items() if key != "aligned_frame"}
+                        task_meta["cache_key"] = cache_key
+                        frame_meta["tasks"].append(task_meta)
+                    chunk_meta["frames"].append(frame_meta)
+                    processed_frames += 1
+                    executor.update_progress("detect", detail="Detecting and aligning faces", step_completed=processed_frames, step_total=total_frames, step_unit="frames")
+                frame_window = []
+        if frame_window:
+            frame_numbers = [item[0] for item in frame_window]
+            frame_plans = build_detect_frame_plans(planner, [item[1] for item in frame_window], memory_plan)
+            for current_frame_number, frame_plan in zip(frame_numbers, frame_plans):
+                frame_meta = {"frame_number": current_frame_number, "fallback": frame_plan["fallback"], "tasks": []}
+                for task_index, task in enumerate(frame_plan["tasks"]):
+                    cache_key = f"f{current_frame_number:08d}_t{task_index:03d}"
+                    task_meta = {key: value for key, value in task.items() if key != "aligned_frame"}
+                    task_meta["cache_key"] = cache_key
+                    frame_meta["tasks"].append(task_meta)
+                chunk_meta["frames"].append(frame_meta)
+                processed_frames += 1
+                executor.update_progress("detect", detail="Detecting and aligning faces", step_completed=processed_frames, step_total=total_frames, step_unit="frames")
     finally:
         planner.release_resources()
     write_cache_blob(plan_path, chunk_meta)

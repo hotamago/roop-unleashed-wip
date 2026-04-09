@@ -52,6 +52,12 @@ class Settings:
         self.prefetch_frames = self.default_get(data, "prefetch_frames", 24)
         if not self.prefetch_frames or self.prefetch_frames <= 0:
             self.prefetch_frames = 24
+        self.detect_batch_size = self.default_get(data, "detect_batch_size", 8)
+        if not self.detect_batch_size or self.detect_batch_size <= 0:
+            self.detect_batch_size = 8
+        self.detect_single_batch_workers = self.default_get(data, "detect_single_batch_workers", 1)
+        if not self.detect_single_batch_workers or self.detect_single_batch_workers <= 0:
+            self.detect_single_batch_workers = 1
         self.swap_batch_size = self.default_get(data, "swap_batch_size", 32)
         if not self.swap_batch_size or self.swap_batch_size <= 0:
             self.swap_batch_size = 32
@@ -134,6 +140,8 @@ class Settings:
             "detect_pack_frame_count": self.detect_pack_frame_count,
             "staged_chunk_size": self.staged_chunk_size,
             "prefetch_frames": self.prefetch_frames,
+            "detect_batch_size": self.detect_batch_size,
+            "detect_single_batch_workers": self.detect_single_batch_workers,
             "swap_batch_size": self.swap_batch_size,
             "mask_batch_size": self.mask_batch_size,
             "enhance_batch_size": self.enhance_batch_size,

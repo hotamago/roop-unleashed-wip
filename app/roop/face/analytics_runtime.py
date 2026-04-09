@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import cv2
 import numpy as np
@@ -66,12 +66,41 @@ def prepare_detect_frame(frame: np.ndarray, resolution: tuple[int, int]) -> np.n
     return detect_frame
 
 
+def prepare_detect_frames_batch(frames: Sequence[np.ndarray], resolution: tuple[int, int]) -> tuple[np.ndarray, list[np.ndarray], list[tuple[float, float]]]:
+    width, height = resolution
+    batch = np.zeros((len(frames), 3, height, width), dtype=np.float32)
+    restricted_frames: list[np.ndarray] = []
+    ratios: list[tuple[float, float]] = []
+    for index, frame in enumerate(frames):
+        temp_frame = restrict_frame(frame, resolution)
+        ratio_height = frame.shape[0] / temp_frame.shape[0]
+        ratio_width = frame.shape[1] / temp_frame.shape[1]
+        batch[index, :, : temp_frame.shape[0], : temp_frame.shape[1]] = temp_frame.transpose(2, 0, 1)
+        restricted_frames.append(temp_frame)
+        ratios.append((ratio_width, ratio_height))
+    return batch, restricted_frames, ratios
+
+
 def normalize_detect_frame(detect_frame: np.ndarray, normalize_range: tuple[int, int]) -> np.ndarray:
     if normalize_range == (-1, 1):
         return (detect_frame - 127.5) / 128.0
     if normalize_range == (0, 1):
         return detect_frame / 255.0
     return detect_frame
+
+
+def resolve_session_batch_size_limit(session) -> int | None:
+    if session is None:
+        return 1
+    batch_size_limit = None
+    for input_meta in session.get_inputs():
+        shape = getattr(input_meta, "shape", None) or []
+        if not shape:
+            continue
+        batch_dim = shape[0]
+        if isinstance(batch_dim, int) and batch_dim > 0:
+            batch_size_limit = batch_dim if batch_size_limit is None else min(batch_size_limit, batch_dim)
+    return batch_size_limit
 
 
 @lru_cache(maxsize=32)
@@ -215,9 +244,29 @@ class BaseFaceDetector:
     providers: Iterable[str]
     det_size: tuple[int, int]
     det_thresh: float = 0.5
+    supports_batch: bool = False
+    batch_size_limit: int | None = 1
+    supports_parallel_single_batch: bool = False
 
     def detect(self, frame: np.ndarray, max_num: int = 0) -> tuple[np.ndarray, np.ndarray | None]:
         raise NotImplementedError
+
+    def detect_batch(
+        self,
+        frames: Sequence[np.ndarray],
+        max_num: int = 0,
+        batch_size: int = 1,
+    ) -> list[tuple[np.ndarray, np.ndarray | None]]:
+        del batch_size
+        return [self.detect(frame, max_num=max_num) for frame in frames]
+
+    def CreateWorkerDetector(self):
+        return self.__class__(self.model_name, list(self.providers), self.det_size, self.det_thresh)
+
+    def Release(self):
+        for name in ("session", "detector"):
+            if hasattr(self, name):
+                setattr(self, name, None)
 
 
 @dataclass
@@ -227,6 +276,7 @@ class RetinaFaceDetector(BaseFaceDetector):
         session = create_inference_session(model_path, providers=list(self.providers))
         self.detector = RetinaFace(model_file=model_path, session=session)
         self.detector.prepare(-1 if "CPUExecutionProvider" in self.providers else 0, input_size=self.det_size, det_thresh=self.det_thresh)
+        self.supports_parallel_single_batch = True
 
     def detect(self, frame: np.ndarray, max_num: int = 0) -> tuple[np.ndarray, np.ndarray | None]:
         return self.detector.detect(frame, input_size=self.det_size, max_num=max_num, metric="default")
@@ -239,6 +289,7 @@ class ScrfdDetector(BaseFaceDetector):
         session = create_inference_session(model_path, providers=list(self.providers))
         self.detector = SCRFD(model_file=model_path, session=session)
         self.detector.prepare(-1 if "CPUExecutionProvider" in self.providers else 0, input_size=self.det_size, det_thresh=self.det_thresh)
+        self.supports_parallel_single_batch = True
 
     def detect(self, frame: np.ndarray, max_num: int = 0) -> tuple[np.ndarray, np.ndarray | None]:
         return self.detector.detect(frame, input_size=self.det_size, max_num=max_num, metric="default")
@@ -250,15 +301,28 @@ class YoloFaceDetector(BaseFaceDetector):
         model_path = get_face_detector_model_paths(self.model_name)[0]
         self.session = create_inference_session(model_path, providers=list(self.providers))
         self.input_name = self.session.get_inputs()[0].name
+        self.batch_size_limit = resolve_session_batch_size_limit(self.session)
+        self.supports_batch = self.batch_size_limit is None or self.batch_size_limit > 1
+        self.supports_parallel_single_batch = True
 
-    def detect(self, frame: np.ndarray, max_num: int = 0) -> tuple[np.ndarray, np.ndarray | None]:
-        temp_frame = restrict_frame(frame, self.det_size)
-        ratio_height = frame.shape[0] / temp_frame.shape[0]
-        ratio_width = frame.shape[1] / temp_frame.shape[1]
-        detect_frame = prepare_detect_frame(temp_frame, self.det_size)
-        detect_frame = normalize_detect_frame(detect_frame, (0, 1))
-        detection = self.session.run(None, {self.input_name: detect_frame})[0]
-        detection = np.squeeze(detection).T
+    @staticmethod
+    def _normalize_detection_output(detection: np.ndarray) -> np.ndarray:
+        detection = np.asarray(detection)
+        if detection.ndim != 2:
+            return np.zeros((0, 0), dtype=np.float32)
+        if detection.shape[0] < detection.shape[1]:
+            detection = detection.T
+        return detection.astype(np.float32, copy=False)
+
+    def _parse_detection(
+        self,
+        frame: np.ndarray,
+        detection: np.ndarray,
+        ratio_width: float,
+        ratio_height: float,
+        max_num: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        detection = self._normalize_detection_output(detection)
         if detection.ndim != 2 or detection.shape[0] == 0:
             return np.zeros((0, 5), dtype=np.float32), None
 
@@ -299,6 +363,41 @@ class YoloFaceDetector(BaseFaceDetector):
             score_threshold=self.det_thresh,
         )
 
+    def detect(self, frame: np.ndarray, max_num: int = 0) -> tuple[np.ndarray, np.ndarray | None]:
+        detect_frame, _restricted_frames, ratios = prepare_detect_frames_batch([frame], self.det_size)
+        detect_frame = normalize_detect_frame(detect_frame, (0, 1))
+        detection = self.session.run(None, {self.input_name: detect_frame})[0]
+        detection = detection[0] if np.asarray(detection).ndim >= 3 else detection
+        ratio_width, ratio_height = ratios[0]
+        return self._parse_detection(frame, detection, ratio_width, ratio_height, max_num=max_num)
+
+    def detect_batch(
+        self,
+        frames: Sequence[np.ndarray],
+        max_num: int = 0,
+        batch_size: int = 1,
+    ) -> list[tuple[np.ndarray, np.ndarray | None]]:
+        if not frames:
+            return []
+        effective_batch_size = max(1, int(batch_size))
+        if self.batch_size_limit is not None:
+            effective_batch_size = min(effective_batch_size, max(1, int(self.batch_size_limit)))
+        if effective_batch_size <= 1:
+            return [self.detect(frame, max_num=max_num) for frame in frames]
+
+        outputs: list[tuple[np.ndarray, np.ndarray | None]] = []
+        for start in range(0, len(frames), effective_batch_size):
+            frame_batch = list(frames[start : start + effective_batch_size])
+            detect_frame, _restricted_frames, ratios = prepare_detect_frames_batch(frame_batch, self.det_size)
+            detect_frame = normalize_detect_frame(detect_frame, (0, 1))
+            detections = self.session.run(None, {self.input_name: detect_frame})[0]
+            detections = np.asarray(detections)
+            for batch_index, frame in enumerate(frame_batch):
+                batch_detection = detections[batch_index] if detections.ndim >= 3 else detections
+                ratio_width, ratio_height = ratios[batch_index]
+                outputs.append(self._parse_detection(frame, batch_detection, ratio_width, ratio_height, max_num=max_num))
+        return outputs
+
 
 @dataclass
 class YuNetDetector(BaseFaceDetector):
@@ -309,13 +408,18 @@ class YuNetDetector(BaseFaceDetector):
         self.feature_strides = [8, 16, 32]
         self.feature_map_channel = 3
         self.anchor_total = 1
+        self.batch_size_limit = resolve_session_batch_size_limit(self.session)
+        self.supports_batch = self.batch_size_limit is None or self.batch_size_limit > 1
+        self.supports_parallel_single_batch = True
 
-    def detect(self, frame: np.ndarray, max_num: int = 0) -> tuple[np.ndarray, np.ndarray | None]:
-        temp_frame = restrict_frame(frame, self.det_size)
-        ratio_height = frame.shape[0] / temp_frame.shape[0]
-        ratio_width = frame.shape[1] / temp_frame.shape[1]
-        detect_frame = prepare_detect_frame(temp_frame, self.det_size)
-        detection = self.session.run(None, {self.input_name: detect_frame})
+    def _parse_detection(
+        self,
+        frame: np.ndarray,
+        detection: list[np.ndarray],
+        ratio_width: float,
+        ratio_height: float,
+        max_num: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
 
         bounding_boxes = []
         scores = []
@@ -382,6 +486,42 @@ class YuNetDetector(BaseFaceDetector):
             nms_threshold=0.4,
             score_threshold=self.det_thresh,
         )
+
+    def detect(self, frame: np.ndarray, max_num: int = 0) -> tuple[np.ndarray, np.ndarray | None]:
+        detect_frame, _restricted_frames, ratios = prepare_detect_frames_batch([frame], self.det_size)
+        detection = self.session.run(None, {self.input_name: detect_frame})
+        ratio_width, ratio_height = ratios[0]
+        sample_detection = [np.asarray(output)[0] if np.asarray(output).ndim >= 3 else np.asarray(output) for output in detection]
+        return self._parse_detection(frame, sample_detection, ratio_width, ratio_height, max_num=max_num)
+
+    def detect_batch(
+        self,
+        frames: Sequence[np.ndarray],
+        max_num: int = 0,
+        batch_size: int = 1,
+    ) -> list[tuple[np.ndarray, np.ndarray | None]]:
+        if not frames:
+            return []
+        effective_batch_size = max(1, int(batch_size))
+        if self.batch_size_limit is not None:
+            effective_batch_size = min(effective_batch_size, max(1, int(self.batch_size_limit)))
+        if effective_batch_size <= 1:
+            return [self.detect(frame, max_num=max_num) for frame in frames]
+
+        outputs: list[tuple[np.ndarray, np.ndarray | None]] = []
+        for start in range(0, len(frames), effective_batch_size):
+            frame_batch = list(frames[start : start + effective_batch_size])
+            detect_frame, _restricted_frames, ratios = prepare_detect_frames_batch(frame_batch, self.det_size)
+            detection_outputs = self.session.run(None, {self.input_name: detect_frame})
+            detection_outputs = [np.asarray(output) for output in detection_outputs]
+            for batch_index, frame in enumerate(frame_batch):
+                sample_detection = [
+                    output[batch_index] if output.ndim >= 3 else output
+                    for output in detection_outputs
+                ]
+                ratio_width, ratio_height = ratios[batch_index]
+                outputs.append(self._parse_detection(frame, sample_detection, ratio_width, ratio_height, max_num=max_num))
+        return outputs
 
 
 @dataclass

@@ -1,5 +1,7 @@
 from .planner import (
+    DEFAULT_DETECT_BATCH_SIZE,
     DEFAULT_DETECT_PACK_FRAME_COUNT,
+    DEFAULT_DETECT_SINGLE_BATCH_WORKERS,
     DEFAULT_ENHANCE_BATCH_SIZE,
     DEFAULT_MASK_BATCH_SIZE,
     DEFAULT_PREFETCH_FRAMES,
@@ -10,12 +12,15 @@ from .planner import (
     get_available_ram_gb,
     get_available_vram_gb,
     provider_uses_gpu,
+    resolve_detect_single_batch_workers,
     resolve_memory_plan,
     resolve_single_batch_workers,
 )
 
 __all__ = [
+    "DEFAULT_DETECT_BATCH_SIZE",
     "DEFAULT_DETECT_PACK_FRAME_COUNT",
+    "DEFAULT_DETECT_SINGLE_BATCH_WORKERS",
     "DEFAULT_ENHANCE_BATCH_SIZE",
     "DEFAULT_MASK_BATCH_SIZE",
     "DEFAULT_PREFETCH_FRAMES",
@@ -26,6 +31,7 @@ __all__ = [
     "get_available_ram_gb",
     "get_available_vram_gb",
     "provider_uses_gpu",
+    "resolve_detect_single_batch_workers",
     "resolve_memory_plan",
     "resolve_single_batch_workers",
 ]

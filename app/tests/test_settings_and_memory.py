@@ -14,6 +14,7 @@ from roop.face_swap_models import (
 )
 from roop.memory.planner import (
     describe_memory_plan,
+    resolve_detect_single_batch_workers,
     resolve_gpu_single_batch_worker_cap,
     resolve_memory_plan,
     resolve_single_batch_workers,
@@ -32,6 +33,8 @@ def test_settings_loads_and_persists_manual_stage_tuning(tmp_path):
     assert cfg.detect_pack_frame_count == 256
     assert cfg.staged_chunk_size == 96
     assert cfg.prefetch_frames == 24
+    assert cfg.detect_batch_size == 8
+    assert cfg.detect_single_batch_workers == 1
     assert cfg.swap_batch_size == 32
     assert cfg.mask_batch_size == 64
     assert cfg.enhance_batch_size == 8
@@ -45,6 +48,8 @@ def test_settings_loads_and_persists_manual_stage_tuning(tmp_path):
     cfg.detect_pack_frame_count = 512
     cfg.staged_chunk_size = 128
     cfg.prefetch_frames = 48
+    cfg.detect_batch_size = 12
+    cfg.detect_single_batch_workers = 2
     cfg.swap_batch_size = 40
     cfg.mask_batch_size = 96
     cfg.enhance_batch_size = 12
@@ -60,6 +65,8 @@ def test_settings_loads_and_persists_manual_stage_tuning(tmp_path):
     assert reloaded.detect_pack_frame_count == 512
     assert reloaded.staged_chunk_size == 128
     assert reloaded.prefetch_frames == 48
+    assert reloaded.detect_batch_size == 12
+    assert reloaded.detect_single_batch_workers == 2
     assert reloaded.swap_batch_size == 40
     assert reloaded.mask_batch_size == 96
     assert reloaded.enhance_batch_size == 12
@@ -142,6 +149,8 @@ def test_resolve_memory_plan_uses_manual_stage_tuning(monkeypatch):
             detect_pack_frame_count=320,
             staged_chunk_size=96,
             prefetch_frames=120,
+            detect_batch_size=10,
+            detect_single_batch_workers=2,
             swap_batch_size=48,
             mask_batch_size=96,
             enhance_batch_size=12,
@@ -156,11 +165,15 @@ def test_resolve_memory_plan_uses_manual_stage_tuning(monkeypatch):
 
     assert plan["chunk_size"] == 96
     assert plan["prefetch_frames"] == 96
+    assert plan["detect_batch_size"] == 10
+    assert plan["detect_single_batch_workers"] == 2
     assert plan["swap_batch_size"] == 48
     assert plan["mask_batch_size"] == 96
     assert plan["enhance_batch_size"] == 12
     assert plan["single_batch_workers"] == 3
     assert plan["detect_pack_frame_count"] == 320
+    assert "detect batch=10" in describe_memory_plan(plan)
+    assert "detect workers=2" in describe_memory_plan(plan)
     assert "single-batch workers=3" in describe_memory_plan(plan)
 
 
@@ -173,6 +186,8 @@ def test_resolve_memory_plan_allows_gpu_single_batch_workers_when_vram_is_availa
             detect_pack_frame_count=256,
             staged_chunk_size=128,
             prefetch_frames=48,
+            detect_batch_size=8,
+            detect_single_batch_workers=2,
             swap_batch_size=8,
             mask_batch_size=8,
             enhance_batch_size=8,
@@ -186,6 +201,7 @@ def test_resolve_memory_plan_allows_gpu_single_batch_workers_when_vram_is_availa
     plan = resolve_memory_plan(1920, 1080)
 
     assert plan["single_batch_workers"] == 2
+    assert plan["detect_single_batch_workers"] == 2
     assert plan["requested_single_batch_workers"] == 2
     assert plan["single_batch_workers_reason"] is None
     assert "single-batch workers=2" in describe_memory_plan(plan)
@@ -200,6 +216,8 @@ def test_resolve_memory_plan_caps_gpu_single_batch_workers_on_low_vram(monkeypat
             detect_pack_frame_count=256,
             staged_chunk_size=128,
             prefetch_frames=48,
+            detect_batch_size=8,
+            detect_single_batch_workers=3,
             swap_batch_size=8,
             mask_batch_size=8,
             enhance_batch_size=8,
@@ -215,6 +233,10 @@ def test_resolve_memory_plan_caps_gpu_single_batch_workers_on_low_vram(monkeypat
     assert plan["single_batch_workers"] == 1
     assert plan["requested_single_batch_workers"] == 3
     assert plan["single_batch_workers_reason"] == "GPU VRAM cap 1"
+    assert plan["detect_single_batch_workers"] == 1
+    assert plan["requested_detect_single_batch_workers"] == 3
+    assert plan["detect_single_batch_workers_reason"] == "GPU VRAM cap 1"
+    assert "detect workers=1 (requested 3, GPU VRAM cap 1)" in describe_memory_plan(plan)
     assert "single-batch workers=1 (requested 3, GPU VRAM cap 1)" in describe_memory_plan(plan)
 
 
@@ -222,6 +244,16 @@ def test_resolve_single_batch_workers_keeps_cpu_parallelism(monkeypatch):
     monkeypatch.setattr("roop.memory.planner.provider_uses_gpu", lambda: False)
 
     effective_workers, requested_workers, reason = resolve_single_batch_workers(4)
+
+    assert effective_workers == 4
+    assert requested_workers == 4
+    assert reason is None
+
+
+def test_resolve_detect_single_batch_workers_keeps_cpu_parallelism(monkeypatch):
+    monkeypatch.setattr("roop.memory.planner.provider_uses_gpu", lambda: False)
+
+    effective_workers, requested_workers, reason = resolve_detect_single_batch_workers(4)
 
     assert effective_workers == 4
     assert requested_workers == 4

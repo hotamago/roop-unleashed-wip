@@ -92,6 +92,8 @@ RESUME_SETTINGS_PERF_KEYS = frozenset(
         "prefetch_frames",
         "staged_chunk_size",
         "detect_pack_frame_count",
+        "detect_batch_size",
+        "detect_single_batch_workers",
         "single_batch_workers",
         "max_threads",
         "video_quality",
