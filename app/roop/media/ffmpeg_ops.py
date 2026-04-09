@@ -2,7 +2,6 @@
 import os
 import subprocess
 import tempfile
-import cv2
 import roop.config.globals
 import roop.utils as util
 
@@ -10,104 +9,28 @@ from typing import List, Any
 from roop.media.video_io import resolve_video_writer_config
 
 
-_GPU_VIDEO_ENCODERS = {"h264_nvenc", "hevc_nvenc"}
-_FINAL_MERGE_TARGET_TOTAL_BYTES = 4_000_000_000
-_FINAL_MERGE_CONTAINER_OVERHEAD_RATIO = 0.98
-_FINAL_MERGE_AUDIO_RESERVE_BPS = 256_000
-_FINAL_MERGE_MIN_VIDEO_BITRATE_BPS = 2_500_000
+def _strip_preset_arg(ffmpeg_params: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    skip_next = False
+    for token in ffmpeg_params:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "-preset":
+            skip_next = True
+            continue
+        cleaned.append(token)
+    return cleaned
 
 
-def _detect_video_duration(video_path: str) -> float:
-    capture = cv2.VideoCapture(video_path)
-    try:
-        if not capture.isOpened():
-            return 0.0
-        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
-        if fps > 0.0 and frame_count > 0.0:
-            return max(frame_count / fps, 0.0)
-        return 0.0
-    finally:
-        capture.release()
-
-
-def _sum_video_durations(video_paths: List[str]) -> float:
-    return sum(_detect_video_duration(video_path) for video_path in video_paths)
-
-
-def _format_bitrate_arg(bits_per_second: float) -> str:
-    return f"{max(1, int(round(bits_per_second / 1000.0)))}k"
-
-
-def _build_concat_reencode_args(videos: List[str]) -> List[str]:
+def _build_concat_reencode_args() -> List[str]:
     writer_config = resolve_video_writer_config(
         roop.config.globals.video_encoder,
         roop.config.globals.video_quality,
     )
     resolved_codec = writer_config["codec"]
     quality_args = list(writer_config["quality_args"])
-    ffmpeg_params: List[str] = []
-
-    duration_seconds = max(_sum_video_durations(videos), 0.0)
-    target_video_bps = None
-    if duration_seconds > 0.0:
-        available_bits = int(_FINAL_MERGE_TARGET_TOTAL_BYTES * 8 * _FINAL_MERGE_CONTAINER_OVERHEAD_RATIO)
-        if not roop.config.globals.skip_audio:
-            available_bits -= int(duration_seconds * _FINAL_MERGE_AUDIO_RESERVE_BPS)
-        target_video_bps = max(
-            _FINAL_MERGE_MIN_VIDEO_BITRATE_BPS,
-            int(available_bits / max(duration_seconds, 1.0)),
-        )
-        maxrate_bps = int(target_video_bps * 1.05)
-        bufsize_bps = maxrate_bps * 2
-    else:
-        maxrate_bps = None
-        bufsize_bps = None
-
-    if resolved_codec in _GPU_VIDEO_ENCODERS:
-        ffmpeg_params.extend(
-            [
-                "-rc",
-                "vbr_hq",
-                "-preset",
-                "p7",
-                "-tune",
-                "hq",
-                "-multipass",
-                "fullres",
-                "-rc-lookahead",
-                "32",
-                "-spatial_aq",
-                "1",
-                "-temporal_aq",
-                "1",
-                "-gpu",
-                str(roop.config.globals.cuda_device_id),
-            ]
-        )
-        if target_video_bps is not None:
-            ffmpeg_params.extend(
-                [
-                    "-b:v",
-                    _format_bitrate_arg(target_video_bps),
-                    "-maxrate",
-                    _format_bitrate_arg(maxrate_bps),
-                    "-bufsize",
-                    _format_bitrate_arg(bufsize_bps),
-                ]
-            )
-    else:
-        ffmpeg_params.extend(["-preset", "slow"])
-        if target_video_bps is not None:
-            ffmpeg_params.extend(
-                [
-                    "-maxrate",
-                    _format_bitrate_arg(maxrate_bps),
-                    "-bufsize",
-                    _format_bitrate_arg(bufsize_bps),
-                ]
-            )
-
+    ffmpeg_params = _strip_preset_arg(list(writer_config["ffmpeg_params"]))
     return ["-c:v", resolved_codec, *quality_args, *ffmpeg_params]
 
 def run_ffmpeg(args: List[str]) -> bool:
@@ -189,7 +112,7 @@ def join_videos(videos: List[str], dest_filename: str, simple: bool, reencode: b
 
             commands = ['-f', 'concat', '-safe', '0', '-i', txtfilename]
             if reencode:
-                commands.extend(_build_concat_reencode_args(videos))
+                commands.extend(_build_concat_reencode_args())
                 commands.extend(['-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an'])
             else:
                 commands.extend(['-vcodec', 'copy'])

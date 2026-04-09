@@ -29,7 +29,7 @@ from roop.utils.cache_paths import get_jobs_root
 
 
 ONE_CHAIN_PIPELINE_VERSION = 1
-ONE_CHAIN_MERGE_PROFILE = "concat_reencode_v2"
+ONE_CHAIN_MERGE_PROFILE = "concat_reencode_v3"
 
 
 def get_one_chain_job_dir(entry, options, output_method):
