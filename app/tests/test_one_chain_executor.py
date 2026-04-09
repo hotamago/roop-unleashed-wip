@@ -1,8 +1,10 @@
 from pathlib import Path
+from threading import current_thread
 
 import numpy as np
 
 import roop.config.globals
+from roop.progress.status import get_processing_status_line
 from roop.pipeline.entry import ProcessEntry
 from roop.pipeline.one_chain_executor import (
     OneChainAllExecutor,
@@ -38,7 +40,12 @@ def test_one_chain_streams_source_frames_into_video_stage_cache(tmp_path, monkey
     source_path = tmp_path / "clip.mp4"
     source_path.write_bytes(b"video")
     entry = ProcessEntry(str(source_path), 0, 4, 30.0)
-    executor = OneChainAllExecutor("File", None, make_options({"faceswap": {}}))
+    progress_updates = []
+    executor = OneChainAllExecutor(
+        "File",
+        lambda progress_value, desc=None, total=None, unit=None: progress_updates.append((progress_value, desc, total, unit)),
+        make_options({"faceswap": {}}),
+    )
     write_calls = []
 
     class FakeProcessMgr:
@@ -86,6 +93,10 @@ def test_one_chain_streams_source_frames_into_video_stage_cache(tmp_path, monkey
     monkeypatch.setattr("roop.pipeline.one_chain_executor.get_one_chain_chunk_size", lambda: 4)
 
     _job_dir, manifest_path, manifest, cache_dir, _merged_video = executor._prepare_job(entry)
+    executor.total_units = 4
+    executor.total_files = 1
+    executor.current_entry = entry
+    executor.current_file_index = 1
 
     assert executor._process_stream_to_cache(entry, 0, 1, cache_dir, manifest, manifest_path, 30.0) is True
 
@@ -97,6 +108,96 @@ def test_one_chain_streams_source_frames_into_video_stage_cache(tmp_path, monkey
     assert segment_path == get_one_chain_segment_path(cache_dir, 0, 4)
     assert list(cache_map.keys()) == [get_one_chain_frame_key(i) for i in range(4)]
     assert np.array_equal(cache_map[get_one_chain_frame_key(3)], np.full((4, 4, 3), 4, dtype=np.uint8))
+    assert roop.config.globals.runtime_processing_state["stage"] == "one_chain"
+    assert roop.config.globals.runtime_processing_state["current_step"] == 2
+    assert roop.config.globals.runtime_processing_state["total_steps"] == 4
+    assert roop.config.globals.runtime_processing_state["step_completed"] == 4
+    assert roop.config.globals.runtime_processing_state["step_total"] == 4
+    assert "Pipeline: 2/4" in get_processing_status_line()
+    assert progress_updates
+    assert progress_updates[-1][0] == (4, 4)
+    assert "Pipeline: 2/4" in (progress_updates[-1][1] or "")
+
+
+def test_one_chain_stream_uses_execution_threads_for_video_workers(tmp_path, monkeypatch):
+    source_path = tmp_path / "clip.mp4"
+    source_path.write_bytes(b"video")
+    entry = ProcessEntry(str(source_path), 0, 4, 30.0)
+    executor = OneChainAllExecutor("File", None, make_options({"faceswap": {}}))
+    created_workers = []
+
+    class FakeFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+        def __hash__(self):
+            return id(self)
+
+    class FakeThreadPoolExecutor:
+        def __init__(self, max_workers=None, thread_name_prefix=None):
+            created_workers.append((max_workers, thread_name_prefix))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            return FakeFuture(fn(*args, **kwargs))
+
+    class FakeProcessMgr:
+        def __init__(self, _progress):
+            self.thread_name = current_thread().name
+
+        def initialize(self, *_args, **_kwargs):
+            return None
+
+        def set_progress_context(self, *_args, **_kwargs):
+            return None
+
+        def process_frame(self, frame):
+            return frame + 5
+
+        def release_resources(self):
+            return None
+
+    class FakeStageCache:
+        def __init__(self, **_kwargs):
+            return None
+
+        def write(self, path, cache_map):
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"segment")
+            path.with_suffix(".idx.bin").write_text("{}", encoding="utf-8")
+            return path
+
+    def fake_iter_video_chunk(_video_path, frame_start, frame_end, _prefetch_frames):
+        for frame_number in range(frame_start, frame_end):
+            yield frame_number, np.full((4, 4, 3), frame_number, dtype=np.uint8)
+
+    def fake_wait(futures, return_when=None):
+        return set(futures), set()
+
+    monkeypatch.setattr(roop.config.globals, "execution_threads", 3, raising=False)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.get_jobs_root", lambda: tmp_path)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.ProcessMgr", FakeProcessMgr)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.VideoStageCache", FakeStageCache)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.iter_video_chunk", fake_iter_video_chunk)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.open_video_capture", lambda _path: FakeCapture())
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.set_processing_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.ThreadPoolExecutor", FakeThreadPoolExecutor)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.wait", fake_wait)
+    monkeypatch.setattr("roop.pipeline.one_chain_executor.get_one_chain_chunk_size", lambda: 4)
+
+    _job_dir, manifest_path, manifest, cache_dir, _merged_video = executor._prepare_job(entry)
+
+    assert executor._process_stream_to_cache(entry, 0, 1, cache_dir, manifest, manifest_path, 30.0) is True
+    assert created_workers == [(3, "one_chain")]
 
 
 def test_one_chain_stream_resume_skips_completed_segments(tmp_path, monkeypatch):

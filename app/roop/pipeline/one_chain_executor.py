@@ -1,7 +1,10 @@
 import hashlib
 import os
 import shutil
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+from threading import local
 
 import roop.config.globals
 import roop.media.ffmpeg_ops as ffmpeg
@@ -19,7 +22,7 @@ from roop.pipeline.staged_executor.cache import (
 )
 from roop.pipeline.staged_executor.video_cache import VideoStageCache
 from roop.pipeline.staged_executor.video_iter import iter_video_chunk
-from roop.progress.status import set_processing_message
+from roop.progress.status import get_processing_status_line, publish_processing_progress, set_processing_message
 from roop.utils.cache_paths import get_jobs_root
 
 
@@ -73,12 +76,28 @@ def get_one_chain_frame_key(frame_number):
     return f"f{int(frame_number):08d}"
 
 
+def get_one_chain_worker_count():
+    try:
+        return max(1, int(getattr(roop.config.globals, "execution_threads", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 class OneChainAllExecutor:
     def __init__(self, output_method, progress, options):
         self.output_method = output_method
         self.progress = progress
         self.options = options
         self.process_mgr = None
+        self.completed_units = 0
+        self.total_units = 0
+        self.total_files = 0
+        self.current_entry = None
+        self.current_file_index = None
+        self.current_chunk_index = None
+        self.current_total_chunks = None
+        self.current_stage = None
+        self.stage_started_at = None
 
     def _ensure_process_mgr(self):
         if self.process_mgr is None:
@@ -90,6 +109,83 @@ class OneChainAllExecutor:
         if self.process_mgr is not None:
             self.process_mgr.release_resources()
             self.process_mgr = None
+
+    def count_total_units(self, files):
+        total = 0
+        for entry in files:
+            if util.has_image_extension(entry.filename):
+                total += 1
+            else:
+                endframe = entry.endframe or get_video_frame_total(entry.filename)
+                total += max(endframe - entry.startframe, 1)
+        self.total_units = max(total, 1)
+
+    def get_pipeline_steps(self):
+        if self.current_entry is not None and util.has_image_extension(self.current_entry.filename):
+            return ["prepare", "one_chain"]
+        steps = ["prepare", "one_chain", "encode"]
+        if self.output_method != "Virtual Camera":
+            steps.append("mux")
+        return steps
+
+    def get_stage_step_info(self, stage):
+        steps = self.get_pipeline_steps()
+        stage_alias = {
+            "resume": "prepare",
+            "images": "one_chain",
+        }
+        stage_key = stage_alias.get(stage, stage)
+        if stage_key not in steps:
+            if stage == "prepare":
+                return 1, len(steps)
+            return None, len(steps)
+        return steps.index(stage_key) + 1, len(steps)
+
+    def update_progress(self, stage, detail=None, step_completed=None, step_total=None, step_unit="items", force_log=False):
+        if stage != self.current_stage or step_completed in (None, 0):
+            self.current_stage = stage
+            self.stage_started_at = time.time()
+        stage_elapsed = None
+        stage_rate = None
+        stage_eta = None
+        if self.stage_started_at is not None:
+            stage_elapsed = max(time.time() - self.stage_started_at, 0.0)
+        if step_completed is not None and step_completed > 0 and stage_elapsed and stage_elapsed > 0:
+            stage_rate = step_completed / stage_elapsed
+        if stage_rate is not None and step_total is not None and step_total > 0:
+            stage_eta = max(step_total - step_completed, 0) / stage_rate
+        target_name = self.current_entry.filename if self.current_entry is not None else None
+        current_step, total_steps = self.get_stage_step_info(stage)
+        publish_processing_progress(
+            stage=stage,
+            completed=self.completed_units,
+            total=self.total_units,
+            unit="units",
+            target_name=target_name,
+            file_index=self.current_file_index,
+            total_files=self.total_files,
+            chunk_index=self.current_chunk_index,
+            total_chunks=self.current_total_chunks,
+            current_step=current_step,
+            total_steps=total_steps,
+            step_completed=step_completed,
+            step_total=step_total,
+            step_unit=step_unit,
+            rate=stage_rate,
+            rate_unit=step_unit,
+            elapsed=stage_elapsed,
+            eta=stage_eta,
+            detail=detail,
+            memory_status=roop.config.globals.runtime_memory_status,
+            force_log=force_log,
+        )
+        if self.progress is not None:
+            self.progress(
+                (self.completed_units, self.total_units),
+                desc=get_processing_status_line(),
+                total=self.total_units,
+                unit="units",
+            )
 
     def _prepare_job(self, entry):
         job_dir = get_one_chain_job_dir(entry, self.options, self.output_method)
@@ -135,7 +231,12 @@ class OneChainAllExecutor:
             return
         process_mgr = self._ensure_process_mgr()
         process_mgr.set_progress_context("one_chain_images", f"{len(imagefiles)} image(s)", unit="images")
+        if imagefiles:
+            self.update_progress("images", detail=f"Processing {len(imagefiles)} image(s) through one-chain-all", step_completed=0, step_total=len(imagefiles), step_unit="images", force_log=True)
         process_mgr.run_batch([entry.filename for entry in imagefiles], [entry.finalname for entry in imagefiles], roop.config.globals.execution_threads)
+        processed_images = len(imagefiles)
+        self.completed_units += processed_images
+        self.update_progress("images", detail="Completed one-chain-all image processing", step_completed=processed_images, step_total=processed_images, step_unit="images", force_log=True)
 
     def _process_stream_to_cache(self, entry, index, total_files, cache_dir, manifest, manifest_path, fps):
         process_mgr = self._ensure_process_mgr()
@@ -172,6 +273,9 @@ class OneChainAllExecutor:
         manifest["completed_frames"] = completed_frames
         manifest["frame_count"] = max(0, entry.endframe - entry.startframe)
         write_json(manifest_path, manifest)
+        entry_progress_base = self.completed_units
+        self.current_total_chunks = len(chunk_ranges)
+        self.completed_units = entry_progress_base + completed_frames
 
         if completed_frames >= manifest["frame_count"] and all(
             (segment_states.get(get_one_chain_segment_key(start_frame, end_frame)) or {}).get("completed")
@@ -179,6 +283,7 @@ class OneChainAllExecutor:
         ):
             manifest["process_complete"] = True
             write_json(manifest_path, manifest)
+            self.update_progress("resume", detail="Reusing completed one-chain packed cache", step_completed=completed_frames, step_total=manifest["frame_count"], step_unit="frames", force_log=True)
             return True
 
         set_processing_message(
@@ -193,6 +298,7 @@ class OneChainAllExecutor:
             force_log=True,
         )
         manifest["status"] = "running"
+        self.update_progress("one_chain", detail="Streaming source decode + full-chain processing into packed video cache", step_completed=completed_frames, step_total=manifest["frame_count"], step_unit="frames", force_log=True)
         stage_cache = VideoStageCache(
             codec="auto",
             crf=0,
@@ -201,35 +307,104 @@ class OneChainAllExecutor:
             fps=max(1, round(fps)),
         )
         processed_frames = completed_frames
+        worker_count = get_one_chain_worker_count()
 
-        for start_frame, end_frame in chunk_ranges:
+        def process_segment_frames(segment_start, segment_end):
+            if worker_count <= 1:
+                frame_cache = {}
+                frames_seen = 0
+                for frame_number, frame in iter_video_chunk(entry.filename, segment_start, segment_end, getattr(roop.config.globals.CFG, "prefetch_frames", 32)):
+                    result = process_mgr.process_frame(frame)
+                    if result is None:
+                        result = frame
+                    frame_cache[get_one_chain_frame_key(frame_number)] = result
+                    frames_seen += 1
+                    yield frames_seen, frame_cache
+                return
+
+            worker_state = local()
+            worker_managers = []
+            pending_futures = {}
+            buffered_results = {}
+            frame_cache = {}
+            frames_seen = 0
+            next_result_frame = segment_start
+            max_in_flight = max(worker_count * 2, 1)
+
+            def get_thread_process_mgr():
+                thread_process_mgr = getattr(worker_state, "process_mgr", None)
+                if thread_process_mgr is None:
+                    thread_process_mgr = ProcessMgr(None)
+                    thread_process_mgr.initialize(roop.config.globals.INPUT_FACESETS, roop.config.globals.TARGET_FACES, self.options)
+                    thread_process_mgr.set_progress_context("one_chain", entry.filename, index + 1, total_files, unit="frames")
+                    worker_state.process_mgr = thread_process_mgr
+                    worker_managers.append(thread_process_mgr)
+                return thread_process_mgr
+
+            def process_one_frame(frame_number, frame):
+                thread_process_mgr = get_thread_process_mgr()
+                result = thread_process_mgr.process_frame(frame)
+                if result is None:
+                    result = frame
+                return frame_number, result
+
+            def flush_done_futures(done_futures):
+                nonlocal frames_seen, next_result_frame
+                for done_future in done_futures:
+                    future_frame_number = pending_futures.pop(done_future)
+                    buffered_results[future_frame_number] = done_future.result()[1]
+                while next_result_frame in buffered_results:
+                    frame_cache[get_one_chain_frame_key(next_result_frame)] = buffered_results.pop(next_result_frame)
+                    frames_seen += 1
+                    next_result_frame += 1
+                    yield frames_seen, frame_cache
+
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="one_chain") as pool:
+                try:
+                    for frame_number, frame in iter_video_chunk(entry.filename, segment_start, segment_end, getattr(roop.config.globals.CFG, "prefetch_frames", 32)):
+                        while len(pending_futures) >= max_in_flight:
+                            done_futures, _ = wait(set(pending_futures), return_when=FIRST_COMPLETED)
+                            for progress_update in flush_done_futures(done_futures):
+                                yield progress_update
+                        pending_futures[pool.submit(process_one_frame, frame_number, frame)] = frame_number
+                    while pending_futures:
+                        done_futures, _ = wait(set(pending_futures), return_when=FIRST_COMPLETED)
+                        for progress_update in flush_done_futures(done_futures):
+                            yield progress_update
+                finally:
+                    for worker_manager in worker_managers:
+                        worker_manager.release_resources()
+
+        for chunk_index, (start_frame, end_frame) in enumerate(chunk_ranges, start=1):
             segment_key = get_one_chain_segment_key(start_frame, end_frame)
             segment_path = get_one_chain_segment_path(cache_dir, start_frame, end_frame)
             segment_state = segment_states.setdefault(segment_key, {})
             segment_frame_count = max(0, end_frame - start_frame)
+            self.current_chunk_index = chunk_index
             if segment_path.exists() and segment_state.get("completed"):
+                self.completed_units = entry_progress_base + processed_frames
+                self.update_progress("resume", detail=f"Reusing one-chain cache segment {segment_key}", step_completed=processed_frames, step_total=manifest["frame_count"], step_unit="frames", force_log=True)
                 continue
 
             frame_cache = {}
             frames_seen = 0
             checkpoint_completed_frames = processed_frames
-            for frame_number, frame in iter_video_chunk(entry.filename, start_frame, end_frame, getattr(roop.config.globals.CFG, "prefetch_frames", 32)):
-                result = process_mgr.process_frame(frame)
-                if result is None:
-                    result = frame
-                frame_cache[get_one_chain_frame_key(frame_number)] = result
-                frames_seen += 1
+            for frames_seen, frame_cache in process_segment_frames(start_frame, end_frame):
                 processed_frames += 1
+                self.completed_units = entry_progress_base + processed_frames
+                self.update_progress("one_chain", detail="Streaming source decode + full-chain processing into packed video cache", step_completed=processed_frames, step_total=manifest["frame_count"], step_unit="frames")
 
             if not roop.config.globals.processing or frames_seen < segment_frame_count:
                 manifest["status"] = "interrupted"
                 manifest["process_complete"] = False
                 processed_frames = checkpoint_completed_frames
+                self.completed_units = entry_progress_base + checkpoint_completed_frames
                 manifest["completed_frames"] = checkpoint_completed_frames
                 segment_state["completed"] = False
                 segment_path.unlink(missing_ok=True)
                 segment_path.with_suffix(".idx.bin").unlink(missing_ok=True)
                 write_json(manifest_path, manifest)
+                self.update_progress("one_chain", detail=f"Interrupted while processing one-chain cache segment {segment_key}", step_completed=checkpoint_completed_frames, step_total=manifest["frame_count"], step_unit="frames", force_log=True)
                 return False
 
             stage_cache.write(segment_path, frame_cache)
@@ -237,13 +412,19 @@ class OneChainAllExecutor:
             segment_state["frame_count"] = segment_frame_count
             manifest["completed_frames"] = processed_frames
             write_json(manifest_path, manifest)
+            self.completed_units = entry_progress_base + processed_frames
+            self.update_progress("one_chain", detail=f"Completed one-chain cache segment {segment_key}", step_completed=processed_frames, step_total=manifest["frame_count"], step_unit="frames", force_log=True)
 
         manifest["process_complete"] = True
         write_json(manifest_path, manifest)
+        self.completed_units = entry_progress_base + processed_frames
+        self.update_progress("one_chain", detail="Completed one-chain packed cache generation", step_completed=processed_frames, step_total=manifest["frame_count"], step_unit="frames", force_log=True)
         return True
 
     def _merge_processed_segments(self, entry, index, total_files, cache_dir, merged_video, manifest, manifest_path):
         if manifest.get("merge_complete") and merged_video.exists():
+            total_segments = max(len(list(iter_one_chain_ranges(entry.startframe, entry.endframe, get_one_chain_chunk_size()))), 1)
+            self.update_progress("encode", detail="Reusing merged one-chain video cache", step_completed=total_segments, step_total=total_segments, step_unit="segments", force_log=True)
             return True
 
         merged_video.unlink(missing_ok=True)
@@ -271,6 +452,8 @@ class OneChainAllExecutor:
             detail="Joining packed processed-cache segments into a single video",
             force_log=True,
         )
+        total_segments = max(len(segment_paths), 1)
+        self.update_progress("encode", detail="Joining packed processed-cache segments into a single video", step_completed=0, step_total=total_segments, step_unit="segments", force_log=True)
         if len(segment_paths) == 1:
             shutil.copyfile(segment_paths[0], str(merged_video))
         else:
@@ -279,12 +462,14 @@ class OneChainAllExecutor:
         manifest["merge_complete"] = merged_ok
         manifest["status"] = "interrupted" if not merged_ok else manifest.get("status", "running")
         write_json(manifest_path, manifest)
+        self.update_progress("encode", detail="Merged one-chain processed cache segments", step_completed=total_segments if merged_ok else 0, step_total=total_segments, step_unit="segments", force_log=True)
         return merged_ok
 
     def _finalize_output(self, entry, index, total_files, merged_video, manifest, manifest_path):
         destination = util.replace_template(entry.finalname, index=index)
         Path(os.path.dirname(destination)).mkdir(parents=True, exist_ok=True)
         if manifest.get("final_complete") and os.path.isfile(destination):
+            self.update_progress("mux", detail="Reusing finalized one-chain output", step_completed=1, step_total=1, step_unit="output", force_log=True)
             return True
 
         set_processing_message(
@@ -298,6 +483,7 @@ class OneChainAllExecutor:
             detail="Muxing encoded video with the final container/output",
             force_log=True,
         )
+        self.update_progress("mux", detail="Muxing encoded video with the final container/output", step_completed=0, step_total=1, step_unit="output", force_log=True)
         if util.has_extension(entry.filename, ["gif"]):
             ffmpeg.create_gif_from_video(str(merged_video), destination)
         elif roop.config.globals.skip_audio:
@@ -309,16 +495,19 @@ class OneChainAllExecutor:
         manifest["final_complete"] = os.path.isfile(destination)
         manifest["status"] = "completed" if manifest["final_complete"] else "interrupted"
         write_json(manifest_path, manifest)
+        self.update_progress("mux", detail="Finished final one-chain output", step_completed=1 if manifest["final_complete"] else 0, step_total=1, step_unit="output", force_log=True)
         return manifest["final_complete"]
 
     def _process_video_entry(self, entry, index, total_files):
         if entry.endframe == 0:
             entry.endframe = get_video_frame_total(entry.filename)
         fps = entry.fps if entry.fps > 0 else util.detect_fps(entry.filename)
-        job_dir, manifest_path, manifest, cache_dir, merged_video = self._prepare_job(entry)
+        _job_dir, manifest_path, manifest, cache_dir, merged_video = self._prepare_job(entry)
 
         destination = util.replace_template(entry.finalname, index=index)
         if manifest.get("final_complete") and os.path.isfile(destination):
+            frame_count = max(entry.endframe - entry.startframe, 1)
+            self.completed_units += frame_count
             set_processing_message(
                 "Reusing one-chain-all output cache",
                 stage="mux",
@@ -330,6 +519,7 @@ class OneChainAllExecutor:
                 detail="Final output already exists for this job",
                 force_log=True,
             )
+            self.update_progress("resume", detail="Skipping completed one-chain output", step_completed=frame_count, step_total=frame_count, step_unit="frames", force_log=True)
             return
 
         if not self._process_stream_to_cache(entry, index, total_files, cache_dir, manifest, manifest_path, fps):
@@ -341,18 +531,26 @@ class OneChainAllExecutor:
     def run(self, files):
         imagefiles = []
         videofiles = []
-        for entry in files:
+        self.count_total_units(files)
+        self.total_files = len(files)
+        for original_index, entry in enumerate(files):
             if util.has_image_extension(entry.filename):
                 imagefiles.append(entry)
             elif util.is_video(entry.filename) or util.has_extension(entry.filename, ["gif"]):
-                videofiles.append(entry)
+                videofiles.append((original_index, entry))
 
         try:
+            if files:
+                self.update_progress("prepare", detail="Preparing one-chain-all job queue", step_completed=0, step_total=len(files), step_unit="files", force_log=True)
             self._process_images(imagefiles)
-            for index, entry in enumerate(videofiles):
+            for original_index, entry in videofiles:
                 if not roop.config.globals.processing:
                     break
-                self._process_video_entry(entry, index, len(videofiles))
+                self.current_entry = entry
+                self.current_file_index = original_index + 1
+                self.current_chunk_index = None
+                self.current_total_chunks = None
+                self._process_video_entry(entry, original_index, len(files))
         finally:
             self.release_resources()
 
@@ -366,5 +564,6 @@ __all__ = [
     "get_one_chain_manifest_signature",
     "get_one_chain_segment_key",
     "get_one_chain_segment_path",
+    "get_one_chain_worker_count",
     "iter_one_chain_ranges",
 ]
